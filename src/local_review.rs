@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::{
+    ai::TurnLimitError,
     git_ops::{GitWorktree, extract_patch_metadata, get_commit_hash, resolve_git_range},
     settings::{AiSettings, Settings},
     toolbox::ToolBox,
@@ -688,6 +689,12 @@ async fn review_single_patch(
                     "AI review for patch {} failed with exception: {}",
                     p.index, e
                 );
+                // Exhausting the turn budget is deterministic: same patch,
+                // same budget, same tool loop. Retrying the whole worker
+                // would only burn the same tokens again, twice.
+                if e.downcast_ref::<TurnLimitError>().is_some() {
+                    return Err(e);
+                }
                 last_error = Some(e);
             }
         }
@@ -928,7 +935,10 @@ async fn run_worker_in_worktree(
         let llm_semaphore = &llm_semaphore;
         let quota = &quota;
         async move {
-            review_single_patch(
+            // A failed patch review must not discard the reviews that
+            // succeeded or cancel the ones still in flight: fold it into
+            // the results as an error entry and keep draining.
+            match review_single_patch(
                 worktree,
                 ai,
                 patchset_id,
@@ -945,13 +955,17 @@ async fn run_worker_in_worktree(
                 progress,
             )
             .await
+            {
+                Ok(v) => v,
+                Err(e) => failed_review_entry(p, &e),
+            }
         }
     }));
 
     let mut buffered = futures_stream.buffer_unordered(concurrency);
     let mut results = Vec::new();
     while let Some(res) = buffered.next().await {
-        results.push(res?);
+        results.push(res);
     }
 
     // Aggregate findings, inline reviews, history, input context, and concern counts
@@ -968,7 +982,7 @@ async fn run_worker_in_worktree(
     let mut total_concerns_count = 0;
     let mut total_dismissed_concerns_count = 0;
 
-    for res in results {
+    for res in &results {
         let p_idx = res["patch_index"].as_i64().unwrap_or(0);
         let patch_subject = patches_to_review
             .iter()
@@ -1062,7 +1076,11 @@ async fn run_worker_in_worktree(
         total_dismissed_concerns_count,
     );
 
-    let combined_result = json!({
+    // Fail the overall result without hiding the partial output: the CLI
+    // prints the JSON, then exits 3 on the non-empty "error" key.
+    let review_error = surface_review_failures(&results, &mut patch_results);
+
+    let mut combined_result = json!({
         "patchset_id": patchset_id,
         "baseline": baseline_arg,
         "patches": patch_results,
@@ -1074,6 +1092,9 @@ async fn run_worker_in_worktree(
         "tokens_out": total_tokens_out,
         "tokens_cached": total_tokens_cached
     });
+    if let Some(error) = review_error {
+        combined_result["error"] = json!(error);
+    }
 
     Ok(combined_result)
 }
@@ -1142,6 +1163,51 @@ pub fn progress_line(event: ProgressEvent) -> Option<String> {
         _ => return None,
     };
     Some(line)
+}
+
+/// Placeholder result for a patch whose review failed after all retries.
+/// Mirrors the shape of a successful entry so the aggregation loop can
+/// consume both uniformly: `review: null` makes every `.get()` miss and
+/// the token counters default to zero.
+fn failed_review_entry(p: &PatchInput, e: &anyhow::Error) -> Value {
+    json!({
+        "patch_index": p.index,
+        "review": null,
+        "error": e.to_string(),
+        "inline_review": null,
+        "input_context": format!("Review failed: {}", e),
+        "history": [],
+        "tokens_in": 0,
+        "tokens_out": 0,
+        "tokens_cached": 0
+    })
+}
+
+/// Annotates failed patch reviews on their patch-status entries and
+/// returns a summary error string when any review failed.
+///
+/// Success entries carry an `"error"` field too (`WorkerResult.error`),
+/// so a result only counts as failed when its `"review"` is absent or
+/// null.
+fn surface_review_failures(results: &[Value], patch_results: &mut [Value]) -> Option<String> {
+    let mut failed = 0usize;
+    for res in results {
+        let Some(error) = res.get("error").and_then(|e| e.as_str()) else {
+            continue;
+        };
+        if !res.get("review").is_none_or(|r| r.is_null()) {
+            continue;
+        }
+        failed += 1;
+        if let Some(index) = res["patch_index"].as_i64()
+            && let Some(patch) = patch_results
+                .iter_mut()
+                .find(|pr| pr["index"].as_i64() == Some(index))
+        {
+            patch["error"] = json!(error);
+        }
+    }
+    (failed > 0).then(|| format!("{} of {} patch reviews failed", failed, results.len()))
 }
 
 pub fn result_has_error(result: &Value) -> bool {
@@ -1992,5 +2058,56 @@ mod tests {
         );
         assert!(progress_line(ProgressEvent::PatchApplied { index: 1 }).is_none());
         assert!(PROGRESS_LINE_PREFIX.ends_with(' '));
+    }
+
+    #[test]
+    fn test_surface_review_failures_annotates_and_summarizes() {
+        let patch = PatchInput {
+            index: 2,
+            diff: String::new(),
+            subject: Some("Feature".to_string()),
+            author: None,
+            date: None,
+            message_id: None,
+            commit_id: None,
+        };
+        let error: anyhow::Error = TurnLimitError { max_turns: 100 }.into();
+
+        let results = vec![
+            json!({
+                "patch_index": 1,
+                "review": { "findings": [] },
+                "error": null,
+            }),
+            failed_review_entry(&patch, &error),
+        ];
+        let mut patch_results = vec![
+            json!({ "index": 1, "status": "applied" }),
+            json!({ "index": 2, "status": "applied" }),
+        ];
+
+        let summary = surface_review_failures(&results, &mut patch_results);
+
+        assert_eq!(summary.as_deref(), Some("1 of 2 patch reviews failed"));
+        assert!(patch_results[0].get("error").is_none());
+        assert!(
+            patch_results[1]["error"]
+                .as_str()
+                .unwrap()
+                .contains("max turns")
+        );
+    }
+
+    #[test]
+    fn test_surface_review_failures_without_failures() {
+        let results = vec![json!({
+            "patch_index": 1,
+            "review": { "findings": [] },
+            "error": null,
+        })];
+        let mut patch_results = vec![json!({ "index": 1, "status": "applied" })];
+
+        assert_eq!(surface_review_failures(&results, &mut patch_results), None);
+        assert!(patch_results[0].get("error").is_none());
     }
 }

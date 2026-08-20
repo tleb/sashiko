@@ -136,6 +136,20 @@ pub trait LlmSession: Send {
     }
 }
 
+/// A session exhausted its conversational turn budget
+/// (`ai.max_interactions`).
+///
+/// Typed rather than an ad-hoc `bail!` so callers can classify it with
+/// `downcast_ref`: hitting the limit is deterministic for a given prompt
+/// and budget, so retrying the whole session only burns the same tokens
+/// a second time.
+#[derive(Debug, thiserror::Error)]
+#[error("Session exceeded max turns limit ({max_turns})")]
+pub struct TurnLimitError {
+    /// The budget that was exhausted.
+    pub max_turns: usize,
+}
+
 /// Orchestrates the execution of an [`LlmSession`].
 pub struct SessionRunner<'a> {
     provider: &'a dyn AiProvider,
@@ -226,7 +240,10 @@ impl<'a> SessionRunner<'a> {
         loop {
             turns += 1;
             if turns > self.max_turns {
-                anyhow::bail!("Session exceeded max turns limit ({})", self.max_turns);
+                return Err(TurnLimitError {
+                    max_turns: self.max_turns,
+                }
+                .into());
             }
             if let Some(ref cb) = self.on_turn {
                 cb(turns, self.max_turns);

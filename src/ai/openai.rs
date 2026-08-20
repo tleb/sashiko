@@ -584,26 +584,26 @@ fn translate_ai_response(resp: OpenAiResponse) -> Result<AiResponse> {
         .ok_or_else(|| anyhow::anyhow!("No choices in response"))?;
 
     let content = choice.message.content;
-        let tool_calls = choice.message.tool_calls.map(|tc| {
-            tc.into_iter()
-                .enumerate()
-                .map(|(i, t)| {
-                    let arguments: Value =
-                        serde_json::from_str(&t.function.arguments).unwrap_or(serde_json::Value::Null);
-                    ToolCall {
-                        // Synthetic id when the endpoint nulls it; the worker
-                        // matches tool results by tool_call_id, so it must be
-                        // unique within the response.
-                        id: t.id.unwrap_or_else(|| format!("call_{i}")),
-                        function_name: t.function.name,
-                        arguments,
-                        thought_signature: None,
-                    }
-                })
-                .collect()
-        });
+    let tool_calls = choice.message.tool_calls.map(|tc| {
+        tc.into_iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let arguments: Value =
+                    serde_json::from_str(&t.function.arguments).unwrap_or(serde_json::Value::Null);
+                ToolCall {
+                    // Synthetic id when the endpoint nulls it; the worker
+                    // matches tool results by tool_call_id, so it must be
+                    // unique within the response.
+                    id: t.id.unwrap_or_else(|| format!("call_{i}")),
+                    function_name: t.function.name,
+                    arguments,
+                    thought_signature: None,
+                }
+            })
+            .collect()
+    });
 
-        let truncated = choice.finish_reason.as_deref() == Some("length");
+    let truncated = choice.finish_reason.as_deref() == Some("length");
 
     if truncated {
         tracing::warn!(

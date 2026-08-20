@@ -172,6 +172,15 @@ This mode:
 
 For local review, Sashiko loads settings from `./Settings.toml` if it exists in the current directory, otherwise from `~/.config/sashiko.toml`. Use `--settings <path>` to point to a specific settings file.
 
+Run `sashiko review --format json` to save the raw review result (for example with `> review.json`). Replay it in the default text format at any time without re-running the review:
+
+```bash
+sashiko json2txt review.json
+sashiko review --format json | sashiko json2txt
+```
+
+Both read from a file or stdin (`-`, the default) and reuse the exact `review --format text` renderer.
+
 ### 2. Daemon Mode
 
 The daemon is responsible for monitoring mailing lists (NNTP), managing the database, and coordinating the AI review process. It also provides a Web UI and an API.

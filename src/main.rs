@@ -25,8 +25,7 @@ use sashiko::prompt_bundle;
 use sashiko::reviewer::Reviewer;
 use sashiko::settings::Settings;
 use serde_json::Value;
-use std::io::IsTerminal;
-use std::io::Write;
+use std::io::{IsTerminal, Read, Write};
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -145,6 +144,17 @@ enum Commands {
         /// Run only these analysis stages, by name
         #[arg(long, hide = true, value_delimiter = ',')]
         stages: Option<Vec<String>>,
+    },
+
+    /// Render a saved JSON review result ("sashiko review --format json" output) as text
+    Json2txt {
+        /// JSON result file, or '-' for stdin (default)
+        #[arg(default_value = "-")]
+        input: String,
+
+        /// When to use color
+        #[arg(long, default_value = "auto")]
+        color: ColorMode,
     },
 
     /// Internal worker mode for JSON-over-stdio review execution
@@ -316,6 +326,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     stages.clone(),
                 )
                 .await;
+            }
+            Commands::Json2txt { input, color } => {
+                return handle_json2txt_command(input.clone(), *color);
             }
             Commands::Worker {
                 json: _,
@@ -2238,9 +2251,40 @@ async fn handle_review_command(
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         OutputFormat::Text => {
-            print_review_result(&result, &input, report.color)?;
+            print_review_result(&result, report.color)?;
         }
     }
+
+    if result_has_error(&result) {
+        std::process::exit(3);
+    }
+    if result_has_high_or_critical_findings(&result) {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+fn handle_json2txt_command(
+    input: String,
+    color: ColorMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let buffer = if input == "-" {
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        buf
+    } else {
+        std::fs::read_to_string(&input)?
+    };
+    let result: Value =
+        serde_json::from_str(&buffer).map_err(|e| format!("{}: invalid JSON: {}", input, e))?;
+
+    let report = OutputStream::detect(
+        color,
+        &std::io::stdout(),
+        terminfo::Database::from_env().ok().as_ref(),
+    );
+    print_review_result(&result, report.color)?;
 
     if result_has_error(&result) {
         std::process::exit(3);
@@ -2269,11 +2313,7 @@ fn current_git_toplevel() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(Path::new(String::from_utf8_lossy(&output.stdout).trim()).to_path_buf())
 }
 
-fn print_review_result(
-    result: &Value,
-    _input: &str,
-    color_choice: ColorChoice,
-) -> std::io::Result<()> {
+fn print_review_result(result: &Value, color_choice: ColorChoice) -> std::io::Result<()> {
     if let Some(error) = result.get("error").and_then(|v| v.as_str())
         && !error.is_empty()
     {
@@ -4156,6 +4196,29 @@ mod tests {
                 assert!(matches!(color, ColorMode::Never));
             }
             _ => panic!("expected review command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_json2txt() {
+        let args = vec!["sashiko", "json2txt"];
+        let cli = Cli::parse_from(args);
+        match cli.command {
+            Some(Commands::Json2txt { input, color }) => {
+                assert_eq!(input, "-");
+                assert!(matches!(color, ColorMode::Auto));
+            }
+            _ => panic!("expected json2txt command"),
+        }
+
+        let args = vec!["sashiko", "json2txt", "review.json", "--color", "never"];
+        let cli = Cli::parse_from(args);
+        match cli.command {
+            Some(Commands::Json2txt { input, color }) => {
+                assert_eq!(input, "review.json");
+                assert!(matches!(color, ColorMode::Never));
+            }
+            _ => panic!("expected json2txt command"),
         }
     }
 

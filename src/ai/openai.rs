@@ -59,7 +59,10 @@ pub struct OpenAiMessage {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct OpenAiToolCall {
-    pub id: String,
+    /// Spec-nullable: some OpenAI-compatible endpoints emit null ids
+    /// mid-tool-use, which would fail decoding of the whole response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     #[serde(rename = "type")]
     pub tool_type: String,
     pub function: OpenAiToolCallFunction,
@@ -96,7 +99,9 @@ pub struct OpenAiResponse {
 pub struct OpenAiChoice {
     pub index: u32,
     pub message: OpenAiMessage,
-    pub finish_reason: String,
+    /// Spec-nullable: endpoints may omit or null it (streaming chunks do).
+    #[serde(default)]
+    pub finish_reason: Option<String>,
 }
 
 /// Every field defaults, and the object itself defaults on the response.
@@ -373,7 +378,14 @@ impl OpenAiCompatClient {
                     return Ok(response);
                 }
                 Err(e) => {
-                    tracing::error!("Failed to decode OpenAI response: {}", e);
+                    tracing::error!(
+                        "Failed to decode OpenAI response: {}\n  around line {} column {} of {} byte body:\n  {}",
+                        e,
+                        e.line(),
+                        e.column(),
+                        body_text.len(),
+                        redact_secret(&json_error_excerpt(&body_text, e.line(), e.column()))
+                    );
                     return Err(OpenAiCompatError::ApiError(
                         status,
                         format!("Parse error: {}", e),
@@ -420,6 +432,23 @@ impl OpenAiCompatClient {
     }
 }
 
+/// Extract a short excerpt around the serde error position (1-based line
+/// and column), single-line, for inclusion in error logs. Falls back to the
+/// start of the body when the position is out of bounds.
+fn json_error_excerpt(body: &str, line: usize, column: usize) -> String {
+    let target_line = body.lines().nth(line.saturating_sub(1)).unwrap_or("");
+    let byte_col = target_line
+        .char_indices()
+        .nth(column.saturating_sub(1))
+        .map(|(i, _)| i)
+        .unwrap_or(target_line.len());
+    let start = byte_col.saturating_sub(240);
+    let end = (byte_col + 240).min(target_line.len());
+    let mut excerpt: String = target_line[start..end].escape_default().collect();
+    excerpt.truncate(1000);
+    excerpt
+}
+
 fn translate_ai_request(
     request: AiRequest,
     max_tokens: u32,
@@ -461,7 +490,7 @@ fn translate_ai_request(
                     tool_calls: msg.tool_calls.map(|tc| {
                         tc.into_iter()
                             .map(|t| OpenAiToolCall {
-                                id: t.id,
+                                id: Some(t.id.clone()),
                                 tool_type: "function".to_string(),
                                 function: OpenAiToolCallFunction {
                                     name: t.function_name,
@@ -555,22 +584,26 @@ fn translate_ai_response(resp: OpenAiResponse) -> Result<AiResponse> {
         .ok_or_else(|| anyhow::anyhow!("No choices in response"))?;
 
     let content = choice.message.content;
-    let tool_calls = choice.message.tool_calls.map(|tc| {
-        tc.into_iter()
-            .map(|t| {
-                let arguments: Value =
-                    serde_json::from_str(&t.function.arguments).unwrap_or(serde_json::Value::Null);
-                ToolCall {
-                    id: t.id,
-                    function_name: t.function.name,
-                    arguments,
-                    thought_signature: None,
-                }
-            })
-            .collect()
-    });
+        let tool_calls = choice.message.tool_calls.map(|tc| {
+            tc.into_iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let arguments: Value =
+                        serde_json::from_str(&t.function.arguments).unwrap_or(serde_json::Value::Null);
+                    ToolCall {
+                        // Synthetic id when the endpoint nulls it; the worker
+                        // matches tool results by tool_call_id, so it must be
+                        // unique within the response.
+                        id: t.id.unwrap_or_else(|| format!("call_{i}")),
+                        function_name: t.function.name,
+                        arguments,
+                        thought_signature: None,
+                    }
+                })
+                .collect()
+        });
 
-    let truncated = choice.finish_reason == "length";
+        let truncated = choice.finish_reason.as_deref() == Some("length");
 
     if truncated {
         tracing::warn!(
@@ -1152,7 +1185,7 @@ mod tests {
                     tool_calls: None,
                     tool_call_id: None,
                 },
-                finish_reason: "stop".to_string(),
+                finish_reason: Some("stop".to_string()),
             }],
             usage: OpenAiUsage {
                 prompt_tokens: 10,
@@ -1187,7 +1220,7 @@ mod tests {
                     tool_calls: None,
                     tool_call_id: None,
                 },
-                finish_reason: "stop".to_string(),
+                finish_reason: Some("stop".to_string()),
             }],
             usage: OpenAiUsage {
                 prompt_tokens: 2048,
@@ -1220,7 +1253,7 @@ mod tests {
                     tool_calls: None,
                     tool_call_id: None,
                 },
-                finish_reason: "stop".to_string(),
+                finish_reason: Some("stop".to_string()),
             }],
             usage: OpenAiUsage {
                 prompt_tokens: 10,
@@ -1305,7 +1338,7 @@ mod tests {
                     tool_calls: None,
                     tool_call_id: None,
                 },
-                finish_reason: "stop".to_string(),
+                finish_reason: Some("stop".to_string()),
             }],
             usage: OpenAiUsage {
                 prompt_tokens: 2048,
@@ -1335,7 +1368,7 @@ mod tests {
                     role: "assistant".to_string(),
                     content: None,
                     tool_calls: Some(vec![OpenAiToolCall {
-                        id: "call_abc".to_string(),
+                        id: Some("call_abc".to_string()),
                         tool_type: "function".to_string(),
                         function: OpenAiToolCallFunction {
                             name: "my_tool".to_string(),
@@ -1344,7 +1377,7 @@ mod tests {
                     }]),
                     tool_call_id: None,
                 },
-                finish_reason: "tool_calls".to_string(),
+                finish_reason: Some("tool_calls".to_string()),
             }],
             usage: OpenAiUsage {
                 prompt_tokens: 15,
@@ -1382,6 +1415,37 @@ mod tests {
 
         let result = translate_ai_response(openai_resp);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_response_with_null_finish_reason_and_null_tool_call_id() {
+        // Some OpenAI-compatible endpoints (observed on OpenRouter with
+        // third-party DeepSeek hosting) emit null finish_reason and null
+        // tool_call ids; the whole response used to fail decoding.
+        let body = r#"{"choices": [{"index": 0, "finish_reason": null,
+            "message": {"role": "assistant", "content": null,
+                "tool_calls": [{"id": null, "type": "function",
+                    "function": {"name": "git_log", "arguments": "{\"n\": 5}"}}]}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}}"#;
+
+        let resp: OpenAiResponse = serde_json::from_str(body).expect("decode");
+        let ai_resp = translate_ai_response(resp).expect("translate");
+
+        assert!(!ai_resp.truncated);
+        let tool_calls = ai_resp.tool_calls.unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_0");
+        assert_eq!(tool_calls[0].function_name, "git_log");
+    }
+
+    #[test]
+    fn test_json_error_excerpt_points_at_error_position() {
+        let body = "{\"a\": \"0123456789\" XMARKER0123456789\"b\": 1}";
+        // serde fails at the X (unexpected token); find its column.
+        let col = body.find("XMARKER").unwrap() + 1;
+        let excerpt = json_error_excerpt(body, 1, col);
+        assert!(excerpt.contains("XMARKER"), "excerpt: {}", excerpt);
+        assert!(excerpt.len() < 600);
     }
 
     #[test]

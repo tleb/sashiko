@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""Render a sashiko review JSON (--format json output) as text.
+
+Faithful port of print_review_result()/print_finding()/count_findings()
+from sashiko src/main.rs. Usage:
+
+    sashiko2txt review.json
+    sashiko review ... --format json | sashiko2txt -
+    sashiko2txt --color=always review.json   (auto|always|never, default auto)
+"""
+
+import json
+import os
+import sys
+
+# termcolor ANSI fg codes, as used by StandardStream::set_color()
+RED, GREEN, YELLOW, CYAN, WHITE = "31", "32", "33", "36", "37"
+RESET = "\x1b[0m"
+COLORS_ON = False
+
+
+def color(code, text):
+    if not COLORS_ON or not text:
+        return text
+    return f"\x1b[{code}m{text}{RESET}"
+
+
+def color_auto():
+    """termcolor ColorChoice::Auto: tty, TERM set and != dumb, no NO_COLOR."""
+    if not sys.stdout.isatty():
+        return False
+    term = os.environ.get("TERM")
+    if term is None or term == "dumb":
+        return False
+    if "NO_COLOR" in os.environ:
+        return False
+    return True
+
+
+def print_finding(finding):
+    severity = finding.get("severity")
+    severity = severity if isinstance(severity, str) else "unknown"
+    code = {
+        "critical": RED, "high": RED,
+        "medium": YELLOW, "low": CYAN,
+    }.get(severity.lower(), WHITE)
+    problem = finding.get("problem")
+    problem = problem if isinstance(problem, str) else ""
+    print(f"  {color(code, f'[{severity}] ')}{problem}")
+
+
+def count_findings(findings):
+    counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+    for finding in findings:
+        if finding.get("preexisting") is True:
+            continue
+        severity = finding.get("severity")
+        severity = severity.lower() if isinstance(severity, str) else ""
+        if severity in counts:
+            counts[severity] += 1
+    return counts
+
+
+def as_i64(v):
+    """serde_json Value::as_i64(): integer (not bool), fits in i64."""
+    if isinstance(v, bool) or not isinstance(v, int):
+        return None
+    if not -(2**63) <= v < 2**63:
+        return None
+    return v
+
+
+def as_u64(v):
+    if isinstance(v, bool) or not isinstance(v, int):
+        return 0
+    return v if 0 <= v < 2**64 else 0
+
+
+def print_review_result(result):
+    error = result.get("error")
+    if isinstance(error, str) and error:
+        print()
+        print(f"{color(RED, 'Error: ')}{error}")
+        return
+
+    review = result.get("review")
+    if not isinstance(review, dict):
+        return
+    findings = review.get("findings")
+    if not isinstance(findings, list):
+        print(color(GREEN, "\nNo AI review was run.\n"))
+        return
+
+    counts = count_findings(findings)
+    total = sum(counts.values())
+    if total == 0:
+        print(color(GREEN, "\nNo issues found.\n"))
+    else:
+        print("\nFindings:")
+        print(
+            f"  Critical: {color(RED, str(counts['critical']))}"
+            f"  High: {color(RED, str(counts['high']))}"
+            f"  Medium: {color(YELLOW, str(counts['medium']))}"
+            f"  Low: {color(CYAN, str(counts['low']))}\n"
+        )
+
+        grouped, ungrouped = {}, []
+        for finding in findings:
+            p_idx = as_i64(finding.get("patch_index"))
+            if p_idx is not None:
+                grouped.setdefault(p_idx, []).append(finding)
+            else:
+                ungrouped.append(finding)
+
+        for p_idx in sorted(grouped):
+            patch_findings = grouped[p_idx]
+            subject = ""
+            if patch_findings:
+                s = patch_findings[0].get("patch_subject")
+                if isinstance(s, str):
+                    subject = s
+            line = f"  --- Patch [{p_idx}] "
+            if subject:
+                line += color(CYAN, subject)
+            print(f"{line} ---")
+            for finding in patch_findings:
+                print_finding(finding)
+            print()
+
+        if ungrouped:
+            print("  --- General Findings ---")
+            for finding in ungrouped:
+                print_finding(finding)
+
+    inline = result.get("inline_review")
+    if isinstance(inline, str):
+        stripped = inline.strip()
+        if stripped and stripped != "No issues found.":
+            print("\nInline Review:")
+            for line in inline.splitlines():
+                if line.startswith(("diff ", "+++", "---")):
+                    print(line)
+                elif line.startswith("+"):
+                    print(color(GREEN, line))
+                elif line.startswith("-"):
+                    print(color(RED, line))
+                elif line.startswith("@@"):
+                    print(color(CYAN, line))
+                else:
+                    print(line)
+
+    tokens_in = as_u64(result.get("tokens_in"))
+    tokens_out = as_u64(result.get("tokens_out"))
+    tokens_cached = as_u64(result.get("tokens_cached"))
+    if tokens_in > 0 or tokens_out > 0 or tokens_cached > 0:
+        print(f"\nTokens: {tokens_in} in / {tokens_out} out / {tokens_cached} cached")
+
+
+def main():
+    global COLORS_ON
+    args = sys.argv[1:]
+    color_mode = "auto"
+    if args and args[0].startswith("--color"):
+        color_mode = args.pop(0).split("=", 1)[-1] if "=" in args[0] else args.pop(0)
+    COLORS_ON = {
+        "auto": color_auto(),
+        "always": True,
+        "never": False,
+    }.get(color_mode, color_auto())
+
+    if len(args) != 1:
+        sys.exit(__doc__)
+    path = args[0]
+    if path == "-":
+        result = json.load(sys.stdin)
+    else:
+        with open(path) as f:
+            result = json.load(f)
+    print_review_result(result)
+
+
+if __name__ == "__main__":
+    main()

@@ -7,3 +7,9 @@ model = "gemma-xyz"
 base_url = "http://localhost:8080/v1"
 context_window_size = 8192
 max_tokens = 2048
+
+# OpenRouter-style provider routing (optional; ignored by endpoints that do
+# not implement the field). provider slugs are tried in order; without
+# allow_fallbacks = false the endpoint may still fall back to other providers.
+# provider_order = ["deepseek", "deepinfra"]
+# allow_fallbacks = false

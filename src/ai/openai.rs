@@ -40,6 +40,10 @@ pub struct OpenAiRequest {
     pub max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<Value>,
+    /// OpenRouter-style routing preferences, sent as the `provider` field.
+    /// Omitted when not configured; other endpoints ignore the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderRouting>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -201,12 +205,23 @@ pub enum OpenAiProviderType {
     OpenAiCompatible,
 }
 
+/// OpenRouter-style routing preferences, serialized as the `provider`
+/// request-body field (`{"order": [...], "allow_fallbacks": bool}`).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ProviderRouting {
+    pub order: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_fallbacks: Option<bool>,
+}
+
 pub struct OpenAiCompatClient {
     model: String,
     base_url: String,
     context_window_size: usize,
     max_tokens: u32,
     provider_type: OpenAiProviderType,
+    /// Serialized as the `provider` request field when routing is configured.
+    provider_routing: Option<ProviderRouting>,
     client: Client,
     temperature_unsupported: AtomicBool,
 }
@@ -219,6 +234,7 @@ impl OpenAiCompatClient {
         context_window_size: usize,
         max_tokens: u32,
         api_timeout_secs: u64,
+        provider_routing: Option<ProviderRouting>,
     ) -> Result<Self> {
         let api_key = std::env::var("OPENAI_API_KEY")
             .or_else(|_| std::env::var("LLM_API_KEY"))
@@ -246,6 +262,7 @@ impl OpenAiCompatClient {
             context_window_size,
             max_tokens,
             provider_type,
+            provider_routing,
             client,
             temperature_unsupported: AtomicBool::new(false),
         })
@@ -254,6 +271,7 @@ impl OpenAiCompatClient {
     fn prepare_request(&self, request: AiRequest) -> Result<OpenAiRequest> {
         let mut openai_req = translate_ai_request(request, self.max_tokens, self.provider_type)?;
         openai_req.model = self.model.clone();
+        openai_req.provider = self.provider_routing.clone();
         if self.temperature_unsupported.load(Ordering::Relaxed) {
             openai_req.temperature = None;
         }
@@ -525,6 +543,7 @@ fn translate_ai_request(
         max_tokens: max_tokens_field,
         max_completion_tokens: max_completion_tokens_field,
         response_format,
+        provider: None,
     })
 }
 
@@ -600,6 +619,7 @@ impl AiProvider for OpenAiCompatClient {
         tracing::info!("Sending OpenAI request...");
 
         let mut openai_req = self.prepare_request(request)?;
+
         let resp_body = serde_json::to_value(&openai_req)?;
         let resp = match self.post_request(&resp_body).await {
             Ok(resp) => resp,
@@ -1459,6 +1479,30 @@ mod tests {
     }
 
     #[test]
+    fn test_provider_routing_serialization() {
+        let plain = ProviderRouting {
+            order: vec!["deepseek".to_string(), "deepinfra".to_string()],
+            allow_fallbacks: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::json!({"order": ["deepseek", "deepinfra"]})
+        );
+
+        let strict = ProviderRouting {
+            allow_fallbacks: Some(false),
+            ..plain
+        };
+        assert_eq!(
+            serde_json::to_value(&strict).unwrap(),
+            serde_json::json!({
+                "order": ["deepseek", "deepinfra"],
+                "allow_fallbacks": false
+            })
+        );
+    }
+
+    #[test]
     fn test_normalize_base_url_appends_chat_completions() {
         // LM Studio style: just /v1
         assert_eq!(
@@ -1556,6 +1600,7 @@ mod tests {
             400_000,
             max_tokens,
             60,
+            None,
         )
         .unwrap()
     }
@@ -1645,6 +1690,7 @@ mod tests {
             8192,
             128,
             5,
+            None,
         )?;
         let request = AiRequest {
             system: None,
@@ -1699,6 +1745,7 @@ mod tests {
                 8192,
                 128,
                 5,
+                None,
             )?;
             let request = AiRequest {
                 system: None,

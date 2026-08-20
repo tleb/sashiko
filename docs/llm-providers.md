@@ -442,6 +442,27 @@ Adjust `base_url` to point to your provider's endpoint.
   `https://api.z.ai/api/coding/paas/v4/chat/completions`. Use this form for
   providers whose path is not a recognised shorthand.
 
+**Provider routing (OpenRouter):**
+
+OpenRouter accepts a `provider` object in the request body to control
+routing. Sashiko exposes an ordered subset of it via
+`[ai.openai_compat]`:
+
+```toml
+[ai.openai_compat]
+base_url = "https://openrouter.ai/api/v1"
+# Try these providers in order (slugs as shown on the OpenRouter model page).
+provider_order = ["deepseek", "deepinfra"]
+# Optional. false restricts routing to the ordered list (fail instead of
+# falling back); the default true keeps other providers as fallbacks.
+allow_fallbacks = false
+```
+
+Setting `provider_order` disables OpenRouter's price-based load balancing.
+Slug shortcuts on the model id (`:floor`, `:nitro`) remain an alternative for
+sort-by-price / sort-by-throughput. Endpoints that do not implement the
+`provider` field ignore it.
+
 **z.ai / Zhipu (glm-*) example:**
 
 z.ai exposes two OpenAI-compatible gateways with **separate billing**: a

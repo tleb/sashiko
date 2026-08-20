@@ -352,6 +352,16 @@ pub struct OpenAiCompatSettings {
     pub context_window_size: Option<usize>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// OpenRouter-style provider routing: provider slugs to try in order,
+    /// serialized as `provider: {"order": [...]}` in the request body.
+    /// Ignored by endpoints that do not implement the field.
+    #[serde(default)]
+    pub provider_order: Option<Vec<String>>,
+    /// Whether the endpoint may fall back to providers outside
+    /// `provider_order`. Serialized as `provider.allow_fallbacks`.
+    /// Only meaningful together with `provider_order`.
+    #[serde(default)]
+    pub allow_fallbacks: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1036,6 +1046,7 @@ mod tests {
     }
 
     #[test]
+    #[test]
     fn test_project_settings_attribution_and_domain() {
         let default_proj = ProjectSettings::default();
         assert_eq!(default_proj.domain, "");
@@ -1079,6 +1090,37 @@ mod tests {
     fn test_init_template_satisfies_local_review() {
         Settings::local_review_from_file("docs/examples/Settings.example.toml")
             .expect("init template must parse as local review settings");
+    }
+
+    #[test]
+    fn test_openai_compat_provider_routing_parses() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sashiko.toml");
+        std::fs::write(
+            &path,
+            r#"
+[ai]
+provider = "openai-compatible"
+model = "deepseek/deepseek-v4-flash-0731"
+
+[ai.openai_compat]
+base_url = "https://openrouter.ai/api/v1"
+provider_order = ["deepseek", "deepinfra"]
+allow_fallbacks = false
+
+[review]
+concurrency = 8
+"#,
+        )
+        .unwrap();
+
+        let settings = Settings::local_review_from_file(&path).unwrap();
+        let compat = settings.ai.openai_compat.expect("openai_compat section");
+        assert_eq!(
+            compat.provider_order,
+            Some(vec!["deepseek".to_string(), "deepinfra".to_string()])
+        );
+        assert_eq!(compat.allow_fallbacks, Some(false));
     }
 
     #[test]

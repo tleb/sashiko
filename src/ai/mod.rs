@@ -546,6 +546,14 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 .and_then(|c| c.max_tokens)
                 .unwrap_or(4096);
 
+            let provider_routing = ai.openai_compat.as_ref().and_then(|c| {
+                let order = c.provider_order.clone()?;
+                (!order.is_empty()).then_some(openai::ProviderRouting {
+                    order,
+                    allow_fallbacks: c.allow_fallbacks,
+                })
+            });
+
             let provider = openai::OpenAiCompatClient::new(
                 base_url,
                 provider_type,
@@ -553,6 +561,7 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 context_window,
                 max_tokens,
                 ai.api_timeout_secs,
+                provider_routing,
             )?;
 
             Ok(Arc::new(provider))

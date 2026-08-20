@@ -779,7 +779,9 @@ pub struct GitSettings {
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct ReviewSettings {
+    #[serde(default = "default_review_concurrency")]
     pub concurrency: usize,
+    #[serde(default = "default_worktree_dir")]
     pub worktree_dir: String,
     #[serde(default = "default_review_timeout")]
     pub timeout_seconds: u64,
@@ -806,6 +808,14 @@ pub struct ReviewSettings {
     pub max_total_output_tokens: usize,
     #[serde(skip)]
     pub stages: Option<Vec<String>>,
+}
+
+fn default_review_concurrency() -> usize {
+    4
+}
+
+fn default_worktree_dir() -> String {
+    "review_trees".to_string()
 }
 
 fn default_max_total_tokens() -> usize {
@@ -890,17 +900,17 @@ fn default_forge() -> ForgeSettings {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct LocalReviewReviewSettings {
-    pub concurrency: usize,
-    #[serde(default = "default_review_timeout")]
-    pub timeout_seconds: u64,
-}
-
+/// Subset of the config consumed by local (CLI) review runs. Unknown top-level
+/// tables must stay tolerated: the same file can be a full production
+/// `Settings.toml` (see `Settings::local_review_path`), which carries
+/// `[database]`, `[nntp]`, etc. that local review ignores. The `[review]` table
+/// itself is strict (`ReviewSettings` denies unknown fields), so a misplaced
+/// key such as `max_interactions` under `[review]` fails at load time instead
+/// of being silently ignored.
 #[derive(Debug, Deserialize, Clone)]
 pub struct LocalReviewSettings {
     pub ai: AiSettings,
-    pub review: LocalReviewReviewSettings,
+    pub review: ReviewSettings,
 }
 impl Settings {
     pub fn new() -> Result<Self, ConfigError> {
@@ -1046,7 +1056,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn test_project_settings_attribution_and_domain() {
         let default_proj = ProjectSettings::default();
         assert_eq!(default_proj.domain, "");
@@ -1121,6 +1130,86 @@ concurrency = 8
             Some(vec!["deepseek".to_string(), "deepinfra".to_string()])
         );
         assert_eq!(compat.allow_fallbacks, Some(false));
+    }
+
+    #[test]
+    fn test_local_review_rejects_unknown_review_fields() {
+        // `max_interactions` belongs to [ai]; under [review] it must fail
+        // loudly instead of being silently dropped.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sashiko.toml");
+        std::fs::write(
+            &path,
+            r#"
+[ai]
+provider = "openai-compatible"
+model = "deepseek/deepseek-v4-flash-0731"
+
+[review]
+concurrency = 1
+max_interactions = 20
+"#,
+        )
+        .unwrap();
+
+        let err = Settings::local_review_from_file(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("max_interactions"),
+            "expected unknown-field error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_local_review_review_table_minimal_parses() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sashiko.toml");
+        std::fs::write(
+            &path,
+            r#"
+[ai]
+provider = "openai-compatible"
+model = "deepseek/deepseek-v4-flash-0731"
+
+[review]
+concurrency = 1
+"#,
+        )
+        .unwrap();
+
+        let settings = Settings::local_review_from_file(&path).unwrap();
+        assert_eq!(settings.review.concurrency, 1);
+    }
+
+    #[test]
+    fn test_local_review_parses_production_review_table() {
+        // A deployment checkout's Settings.toml is picked up by
+        // Settings::local_review_path(); its full [review] table must keep
+        // parsing as a local-review config.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Settings.toml");
+        std::fs::write(
+            &path,
+            r#"
+[ai]
+provider = "openai-compatible"
+model = "deepseek/deepseek-v4-flash-0731"
+
+[review]
+concurrency = 16
+worktree_dir = "review_trees"
+timeout_seconds = 7200
+max_retries = 3
+ignore_files = ["MAINTAINERS"]
+
+[database]
+url = "libsql://example.db"
+"#,
+        )
+        .unwrap();
+
+        let settings = Settings::local_review_from_file(&path).unwrap();
+        assert_eq!(settings.review.concurrency, 16);
+        assert_eq!(settings.review.worktree_dir, "review_trees");
     }
 
     #[test]

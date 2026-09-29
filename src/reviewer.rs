@@ -144,7 +144,7 @@ impl Reviewer {
             .await
             .expect("Failed to create AI provider");
 
-        let llm_concurrency = crate::ai::concurrency_limited_provider::llm_permits(concurrency);
+        let llm_concurrency = settings.ai.max_concurrent_requests.max(1);
 
         Self {
             db,

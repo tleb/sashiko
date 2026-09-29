@@ -920,9 +920,7 @@ async fn run_worker_in_worktree(
     // is bounded by `concurrency`; each patch then fans its stages out
     // concurrently on top of that, so without a shared ceiling the number of
     // simultaneous requests is unbounded.
-    let llm_semaphore = Arc::new(Semaphore::new(
-        crate::ai::concurrency_limited_provider::llm_permits(concurrency),
-    ));
+    let llm_semaphore = Arc::new(Semaphore::new(ai.max_concurrent_requests.max(1)));
     // Shared so a rate-limit response from one request backs the whole run off.
     let quota = Arc::new(crate::ai::quota::QuotaManager::new());
     // Execute patch reviews concurrently with a limit

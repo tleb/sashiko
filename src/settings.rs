@@ -513,6 +513,12 @@ pub struct AiSettings {
     pub temperature: f32,
     #[serde(default = "default_api_timeout_secs")]
     pub api_timeout_secs: u64,
+    /// Maximum model calls in flight at once, across every concurrent
+    /// review, stage and turn. A property of the subscription behind the
+    /// endpoint rather than of the review process, so it is configured here
+    /// instead of being derived from [review] concurrency.
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
     #[serde(skip, default)]
     pub no_ai: bool,
     /// Log each AI request/response turn at info level (content previews + token counts).
@@ -546,6 +552,10 @@ fn default_response_cache_ttl_days() -> u64 {
 
 fn default_api_timeout_secs() -> u64 {
     300
+}
+
+fn default_max_concurrent_requests() -> usize {
+    3
 }
 
 fn default_temperature() -> f32 {
@@ -1091,6 +1101,32 @@ mod tests {
         assert_eq!(settings.review.concurrency, 8);
         // timeout_seconds keeps a default, as it does for the daemon.
         assert_eq!(settings.review.timeout_seconds, 3600);
+    }
+
+    /// max_concurrent_requests belongs to the endpoint rather than to the
+    /// review process, so it lives under [ai] with a default instead of being
+    /// derived from [review] concurrency.
+    #[test]
+    fn test_max_concurrent_requests_defaults_and_overrides() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Settings.toml");
+        std::fs::write(
+            &path,
+            "[ai]\nprovider = \"gemini\"\nmodel = \"gemini-3-pro\"\n\
+             [review]\nconcurrency = 1\n",
+        )
+        .unwrap();
+        let settings = Settings::local_review_from_file(&path).unwrap();
+        assert_eq!(settings.ai.max_concurrent_requests, 3);
+
+        std::fs::write(
+            &path,
+            "[ai]\nprovider = \"gemini\"\nmodel = \"gemini-3-pro\"\n\
+             max_concurrent_requests = 8\n[review]\nconcurrency = 1\n",
+        )
+        .unwrap();
+        let settings = Settings::local_review_from_file(&path).unwrap();
+        assert_eq!(settings.ai.max_concurrent_requests, 8);
     }
 
     /// `sashiko init` writes this template, so it has to satisfy the shape a

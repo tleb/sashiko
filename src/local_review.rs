@@ -317,6 +317,24 @@ pub async fn run_worker(
         ai.provider = provider.clone();
     }
 
+    // Everything a later reader of the dump needs to interpret the timings:
+    // the model, its endpoint knobs, and the limits the run was under.
+    crate::ai::trace::event(
+        "run_settings",
+        json!({
+            "provider": ai.provider,
+            "model": ai.model,
+            "max_concurrent_requests": ai.max_concurrent_requests,
+            "api_timeout_secs": ai.api_timeout_secs,
+            "max_input_tokens": ai.max_input_tokens,
+            "max_interactions": ai.max_interactions,
+            "review_concurrency": concurrency,
+            "deadline_secs": timeout_seconds,
+            "patches": input.patches.len(),
+            "project": options.project.as_str(),
+        }),
+    );
+
     let patchset_id = input.id;
     let subject = input.subject;
     let patches = input.patches;

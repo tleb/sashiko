@@ -333,14 +333,26 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
 
         let futures = to_run.into_iter().map(|(idx, call)| {
             let tools = self.tools.clone();
+            let ctx = self.context_tag.clone();
             async move {
                 // A rejected call is the model's to read and correct. The
                 // trait default propagates the error instead, which ends the
                 // stage and with it the review.
+                let started = std::time::Instant::now();
                 let res = match tools.call(&call.function_name, call.arguments).await {
                     Ok(v) => v,
                     Err(e) => json!({ "error": e.to_string() }),
                 };
+                crate::ai::trace::event(
+                    "tool",
+                    json!({
+                        "ctx": ctx,
+                        "tool": call.function_name,
+                        "duration_ms": started.elapsed().as_millis() as u64,
+                        "result_chars": res.to_string().len(),
+                        "ok": res.get("error").is_none(),
+                    }),
+                );
                 (idx, (call.id, res))
             }
         });
@@ -411,6 +423,15 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                 stage_name: self.name,
             });
         }
+        let stage_started = std::time::Instant::now();
+        crate::ai::trace::event(
+            "stage",
+            serde_json::json!({
+                "ctx": env.context_tag,
+                "name": self.name,
+                "phase": "start",
+            }),
+        );
 
         let system_prompt = if let Some(sys) = &self.system_prompt {
             sys.render_for_model(state, env.base_dir).await?
@@ -457,6 +478,19 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
         let tokens_in = result.usage.prompt_tokens as u32;
         let tokens_out = result.usage.completion_tokens as u32;
         let tokens_cached = result.usage.cached_tokens.unwrap_or(0) as u32;
+
+        crate::ai::trace::event(
+            "stage",
+            serde_json::json!({
+                "ctx": env.context_tag,
+                "name": self.name,
+                "phase": "end",
+                "duration_ms": stage_started.elapsed().as_millis() as u64,
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+                "tokens_cached": tokens_cached,
+            }),
+        );
 
         if let Some(cb) = event_cb {
             cb(WorkflowEvent::StageFinished {

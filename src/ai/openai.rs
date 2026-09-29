@@ -697,6 +697,9 @@ impl OpenAiCompatClient {
         &self,
         res: reqwest::Response,
     ) -> Result<OpenAiResponse, OpenAiCompatError> {
+        let started = std::time::Instant::now();
+        let mut first_event: Option<std::time::Instant> = None;
+        let mut bytes = 0usize;
         let mut stream = res.bytes_stream();
         let mut buffer: Vec<u8> = Vec::new();
         let mut assembled = StreamedResponse::default();
@@ -707,6 +710,10 @@ impl OpenAiCompatClient {
                 tracing::error!("OpenAI stream failed (transport): {}", err_str);
                 OpenAiCompatError::TransientError(Duration::from_secs(30), err_str)
             })?;
+            if first_event.is_none() {
+                first_event = Some(std::time::Instant::now());
+            }
+            bytes += chunk.len();
             buffer.extend_from_slice(&chunk);
             for line in drain_complete_lines(&mut buffer) {
                 if absorb_sse_line(&line, &mut assembled)? {
@@ -728,6 +735,14 @@ impl OpenAiCompatClient {
             ));
         }
         let response = assembled.into_response();
+        crate::ai::trace::event(
+            "llm_stream",
+            serde_json::json!({
+                "ttfb_ms": first_event.map_or(0, |t| (t - started).as_millis() as u64),
+                "duration_ms": started.elapsed().as_millis() as u64,
+                "bytes": bytes,
+            }),
+        );
         tracing::info!(
             "OpenAI response received. Tokens: in={}, out={}",
             response.usage.prompt_tokens,

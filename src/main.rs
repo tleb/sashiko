@@ -144,6 +144,11 @@ enum Commands {
         /// Run only these analysis stages, by name
         #[arg(long, hide = true, value_delimiter = ',')]
         stages: Option<Vec<String>>,
+
+        /// Dump every model call, retry, wait, tool call and stage of the
+        /// run to a JSONL file (default: a new file under the data directory)
+        #[arg(long, num_args = 0..=1)]
+        trace: Option<Option<PathBuf>>,
     },
 
     /// Render a saved JSON review result ("sashiko review --format json" output) as text
@@ -311,7 +316,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format,
                 color,
                 stages,
+                trace,
             } => {
+                if let Some(path) = trace.as_ref().and_then(|explicit| {
+                    explicit
+                        .clone()
+                        .or_else(|| default_trace_path().map(PathBuf::from))
+                }) {
+                    sashiko::ai::trace::init(&path)?;
+                    eprintln!("Trace: {}", path.display());
+                }
                 return handle_review_command(
                     project,
                     input.clone(),
@@ -2010,6 +2024,13 @@ fn calculate_progress_metrics(
     let filled = (display_completed_stages.saturating_mul(width) / total_stages).min(width);
 
     (display_completed_stages, percent, filled)
+}
+
+fn default_trace_path() -> Option<String> {
+    sashiko::ai::trace::default_run_path()
+        .into_os_string()
+        .into_string()
+        .ok()
 }
 
 #[allow(clippy::too_many_arguments)]

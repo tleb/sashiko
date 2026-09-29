@@ -29,7 +29,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::Semaphore;
 
+use crate::ai::trace;
 use crate::ai::{AiProvider, AiRequest, AiResponse, CacheStats, ProviderCapabilities};
+use serde_json::json;
 
 static LLM_GATE: OnceLock<Semaphore> = OnceLock::new();
 
@@ -63,10 +65,18 @@ impl ConcurrencyLimitedProvider {
 #[async_trait]
 impl AiProvider for ConcurrencyLimitedProvider {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+        let started = std::time::Instant::now();
         let _permit = llm_gate()
             .acquire()
             .await
             .map_err(|e| anyhow::anyhow!("concurrency semaphore closed: {e}"))?;
+        let waited = started.elapsed();
+        if waited > std::time::Duration::from_millis(10) {
+            trace::event(
+                "gate_wait",
+                json!({ "waited_ms": waited.as_millis() as u64 }),
+            );
+        }
         self.inner.generate_content(request).await
     }
 

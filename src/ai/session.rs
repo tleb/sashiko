@@ -236,6 +236,21 @@ impl<'a> SessionRunner<'a> {
         let mut total_prompt_tokens = 0;
         let mut total_completion_tokens = 0;
         let mut total_cached_tokens = 0;
+        let ctx_tag = session.context_tag();
+        let turn_event = |turn: usize, outcome: &str, extra: serde_json::Value| {
+            let mut record = serde_json::json!({
+                "ctx": ctx_tag,
+                "turn": turn,
+                "max_turns": self.max_turns,
+                "outcome": outcome,
+            });
+            if let (serde_json::Value::Object(record), serde_json::Value::Object(extra)) =
+                (&mut record, extra)
+            {
+                record.extend(extra);
+            }
+            crate::ai::trace::event("turn", record);
+        };
 
         loop {
             turns += 1;
@@ -277,12 +292,22 @@ impl<'a> SessionRunner<'a> {
                 context_tag: session.context_tag(),
             };
 
+            let turn_started = std::time::Instant::now();
             let resp = match self.provider.generate_content(request).await {
                 Ok(r) => r,
                 Err(e) => match classify_ai_error(&e) {
                     AiErrorClass::RateLimit { retry_after }
                     | AiErrorClass::Transient { retry_after } => {
                         transient_retries += 1;
+                        turn_event(
+                            turns,
+                            "provider_retry",
+                            serde_json::json!({
+                                "retry": transient_retries,
+                                "retry_after_ms": retry_after.as_millis() as u64,
+                                "duration_ms": turn_started.elapsed().as_millis() as u64,
+                            }),
+                        );
                         if transient_retries > self.max_transient_retries {
                             anyhow::bail!(
                                 "Session failed after {} transient/rate-limit errors. Last error: {}",
@@ -302,6 +327,14 @@ impl<'a> SessionRunner<'a> {
                         continue;
                     }
                     AiErrorClass::Fatal => {
+                        turn_event(
+                            turns,
+                            "provider_fatal",
+                            serde_json::json!({
+                                "duration_ms": turn_started.elapsed().as_millis() as u64,
+                                "error": e.to_string(),
+                            }),
+                        );
                         match session.handle_provider_error(&e, provider_error_retries) {
                             ErrorAction::RetryWithFeedback(feedback) => {
                                 provider_error_retries += 1;
@@ -332,6 +365,13 @@ impl<'a> SessionRunner<'a> {
             };
 
             if resp.truncated {
+                turn_event(
+                    turns,
+                    "truncated",
+                    serde_json::json!({
+                        "duration_ms": turn_started.elapsed().as_millis() as u64,
+                    }),
+                );
                 anyhow::bail!("LLM output was truncated by provider (e.g. hit max tokens)");
             }
 
@@ -361,6 +401,16 @@ impl<'a> SessionRunner<'a> {
                         "Model emitted tool calls on final turn; ignoring tools to force validation."
                     );
                 } else {
+                    turn_event(
+                        turns,
+                        "tool_calls",
+                        serde_json::json!({
+                            "tools": tool_calls.iter().map(|t| t.function_name.as_str()).collect::<Vec<_>>(),
+                            "tokens_in": resp.usage.as_ref().map_or(0, |u| u.prompt_tokens),
+                            "tokens_out": resp.usage.as_ref().map_or(0, |u| u.completion_tokens),
+                            "duration_ms": turn_started.elapsed().as_millis() as u64,
+                        }),
+                    );
                     let results = session.call_tools(tool_calls.clone()).await?;
                     for (call_id, result) in results {
                         let tool_msg = AiMessage {
@@ -379,6 +429,15 @@ impl<'a> SessionRunner<'a> {
             }
 
             // No tool calls: validate response
+            turn_event(
+                turns,
+                "final",
+                serde_json::json!({
+                    "tokens_in": resp.usage.as_ref().map_or(0, |u| u.prompt_tokens),
+                    "tokens_out": resp.usage.as_ref().map_or(0, |u| u.completion_tokens),
+                    "duration_ms": turn_started.elapsed().as_millis() as u64,
+                }),
+            );
             match session.validate(&resp) {
                 Result::Ok(output) => {
                     let usage = AiUsage {
@@ -395,6 +454,14 @@ impl<'a> SessionRunner<'a> {
                 }
                 Result::Err(ValidationError::FormatViolation(violation)) => {
                     validation_attempts += 1;
+                    turn_event(
+                        turns,
+                        "validation_retry",
+                        serde_json::json!({
+                            "attempt": validation_attempts,
+                            "violation": violation,
+                        }),
+                    );
                     if validation_attempts >= self.max_validation_attempts {
                         anyhow::bail!(
                             "Failed to generate valid response after {} validation attempts. Last violation: {}",

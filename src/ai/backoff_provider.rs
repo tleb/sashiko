@@ -37,10 +37,12 @@ use tokio::time::sleep;
 use tracing::warn;
 
 use crate::ai::quota::QuotaManager;
+use crate::ai::trace;
 use crate::ai::{
     AiErrorClass, AiProvider, AiRequest, AiResponse, CacheStats, ProviderCapabilities,
     classify_ai_error, get_log_prefix,
 };
+use serde_json::json;
 
 /// Maximum number of attempts (initial try plus retries) for a single call
 /// before the last error is propagated. Bounds wall-clock so a sustained
@@ -145,39 +147,98 @@ impl BackoffProvider {
             budget,
         }
     }
+
+    fn class_str(class: &AiErrorClass) -> &'static str {
+        match class {
+            AiErrorClass::Fatal => "fatal",
+            AiErrorClass::RateLimit { .. } => "rate_limit",
+            AiErrorClass::Transient { .. } => "transient",
+        }
+    }
 }
 
 #[async_trait]
 impl AiProvider for BackoffProvider {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+        // The tag rides a task local so the gate and the HTTP client below
+        // this loop can name their patch and stage in trace events.
+        let tag = request.context_tag.clone();
+        trace::scope_ctx(tag, self.generate_with_retries(request)).await
+    }
+
+    fn get_capabilities(&self) -> ProviderCapabilities {
+        self.inner.get_capabilities()
+    }
+
+    fn cache_stats(&self) -> Option<CacheStats> {
+        self.inner.cache_stats()
+    }
+}
+
+impl BackoffProvider {
+    async fn generate_with_retries(&self, request: AiRequest) -> Result<AiResponse> {
         let mut attempt: u32 = 0;
         let mut transient_streak: i32 = 0;
         loop {
             // Honour any active global rate-limit window before trying. The
             // wait is reported so a caller can keep it off its own deadline.
             let slept = self.quota.wait_for_access().await;
+            if slept > Duration::ZERO {
+                trace::event(
+                    "quota_wait",
+                    json!({ "waited_ms": slept.as_millis() as u64 }),
+                );
+            }
             if let Some(budget) = &self.budget {
                 budget.credit_wait(slept);
                 budget.check()?;
             }
 
+            let attempt_started = std::time::Instant::now();
             match self.inner.generate_content(request.clone()).await {
                 Ok(response) => {
                     self.quota.report_success().await;
+                    trace::event(
+                        "llm_attempt",
+                        json!({
+                            "attempt": attempt + 1,
+                            "duration_ms": attempt_started.elapsed().as_millis() as u64,
+                            "outcome": "ok",
+                            "tokens_in": response.usage.as_ref().map_or(0, |u| u.prompt_tokens),
+                            "tokens_out": response.usage.as_ref().map_or(0, |u| u.completion_tokens),
+                        }),
+                    );
                     return Ok(response);
                 }
                 Err(e) => {
                     attempt += 1;
+                    let class = classify_ai_error(&e);
+                    trace::event(
+                        "llm_attempt",
+                        json!({
+                            "attempt": attempt,
+                            "duration_ms": attempt_started.elapsed().as_millis() as u64,
+                            "outcome": Self::class_str(&class),
+                            "error": e.to_string(),
+                        }),
+                    );
                     if let Some(max) = self.max_attempts
                         && attempt >= max
                     {
                         return Err(e);
                     }
-                    match classify_ai_error(&e) {
+                    match class {
                         AiErrorClass::RateLimit { retry_after } => {
                             // Account-wide: block every concurrent request
                             // until it clears. The next iteration's
                             // wait_for_access() performs the sleep.
+                            trace::event(
+                                "backoff",
+                                json!({
+                                    "reason": "rate_limit",
+                                    "retry_after_ms": retry_after.as_millis() as u64,
+                                }),
+                            );
                             self.quota.report_quota_error(retry_after).await;
                         }
                         AiErrorClass::Transient { retry_after } => {
@@ -200,6 +261,15 @@ impl AiProvider for BackoffProvider {
                                 retry_target,
                                 e
                             );
+                            trace::event(
+                                "backoff",
+                                json!({
+                                    "reason": "transient",
+                                    "streak": transient_streak,
+                                    "retry_after_ms": retry_after.as_millis() as u64,
+                                    "sleep_ms": jittered.as_millis() as u64,
+                                }),
+                            );
                             sleep(jittered).await;
                         }
                         AiErrorClass::Fatal => return Err(e),
@@ -207,14 +277,6 @@ impl AiProvider for BackoffProvider {
                 }
             }
         }
-    }
-
-    fn get_capabilities(&self) -> ProviderCapabilities {
-        self.inner.get_capabilities()
-    }
-
-    fn cache_stats(&self) -> Option<CacheStats> {
-        self.inner.cache_stats()
     }
 }
 

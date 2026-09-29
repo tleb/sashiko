@@ -730,6 +730,7 @@ pub mod proxy;
 pub mod quota;
 pub mod session;
 pub mod token_budget;
+pub mod trace;
 pub mod truncator;
 pub mod vector_search;
 #[cfg(feature = "vertex")]

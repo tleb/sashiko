@@ -1429,8 +1429,13 @@ async fn analyze_bug(
 
     // Uncached, as this asked for before the cached constructor grew to take the
     // AI settings and a database path: filing a bug is a one-off analysis.
-    let provider = match crate::ai::create_provider(&state.settings) {
-        Ok(p) => p,
+    // Wrapped, so the analysis counts against the process-wide in-flight
+    // ceiling rather than adding requests on top of it.
+    let provider: Arc<dyn crate::ai::AiProvider> = match crate::ai::create_provider(&state.settings)
+    {
+        Ok(p) => {
+            Arc::new(crate::ai::concurrency_limited_provider::ConcurrencyLimitedProvider::new(p))
+        }
         Err(e) => {
             // The reason names the provider and its configuration, so it stays
             // in the log rather than going back over the wire.

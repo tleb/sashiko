@@ -47,7 +47,6 @@ use tracing::{error, info, warn};
 #[derive(Clone)]
 struct ReviewContext {
     semaphore: Arc<Semaphore>,
-    llm_semaphore: Arc<Semaphore>,
     db: Arc<Database>,
     settings: Settings,
     baseline_registry: Arc<BaselineRegistry>,
@@ -106,7 +105,6 @@ pub struct Reviewer {
     db: Arc<Database>,
     settings: Settings,
     semaphore: Arc<Semaphore>,
-    llm_semaphore: Arc<Semaphore>,
     baseline_registry: Arc<BaselineRegistry>,
     quota_manager: Arc<QuotaManager>,
     provider: Arc<dyn AiProvider>,
@@ -144,13 +142,10 @@ impl Reviewer {
             .await
             .expect("Failed to create AI provider");
 
-        let llm_concurrency = settings.ai.max_concurrent_requests.max(1);
-
         Self {
             db,
             settings,
             semaphore: Arc::new(Semaphore::new(concurrency)),
-            llm_semaphore: Arc::new(Semaphore::new(llm_concurrency)),
             baseline_registry,
             quota_manager: Arc::new(QuotaManager::new()),
             provider,
@@ -247,7 +242,6 @@ impl Reviewer {
 
             let context = ReviewContext {
                 semaphore: self.semaphore.clone(),
-                llm_semaphore: self.llm_semaphore.clone(),
                 db: self.db.clone(),
                 settings: self.settings.clone(),
                 baseline_registry: self.baseline_registry.clone(),
@@ -288,7 +282,6 @@ impl Reviewer {
 
             let context = ReviewContext {
                 semaphore: self.semaphore.clone(),
-                llm_semaphore: self.llm_semaphore.clone(),
                 db: self.db.clone(),
                 settings: self.settings.clone(),
                 baseline_registry: self.baseline_registry.clone(),
@@ -1642,7 +1635,6 @@ impl Reviewer {
                 review_id,
                 worktree_path,
                 ctx.provider.clone(),
-                ctx.llm_semaphore.clone(),
             )
             .await;
 
@@ -2150,7 +2142,6 @@ async fn run_review_tool(
     review_id: i64,
     worktree_path: Option<&Path>,
     provider: Arc<dyn AiProvider>,
-    llm_semaphore: Arc<Semaphore>,
 ) -> Result<serde_json::Value> {
     let cmd = default_worker_command()?;
     run_review_tool_with_cmd(
@@ -2166,7 +2157,6 @@ async fn run_review_tool(
         review_id,
         worktree_path,
         provider,
-        llm_semaphore,
     )
     .await
 }
@@ -2210,17 +2200,13 @@ async fn run_review_tool_with_cmd(
     review_id: i64,
     worktree_path: Option<&Path>,
     provider: Arc<dyn AiProvider>,
-    llm_semaphore: Arc<Semaphore>,
 ) -> Result<serde_json::Value> {
     // Cap concurrent model calls with the shared limiter instead of taking the
     // semaphore by hand around each call. This also releases the permit as soon
     // as the call returns, so a request that is backing off no longer occupies
     // a slot while it sleeps.
     let provider: Arc<dyn AiProvider> = Arc::new(
-        crate::ai::concurrency_limited_provider::ConcurrencyLimitedProvider::new(
-            provider,
-            llm_semaphore.clone(),
-        ),
+        crate::ai::concurrency_limited_provider::ConcurrencyLimitedProvider::new(provider),
     );
     cmd.args([
         "--json",
@@ -3275,7 +3261,6 @@ mod tests {
 
         let ctx = ReviewContext {
             semaphore: Arc::new(Semaphore::new(1)),
-            llm_semaphore: Arc::new(Semaphore::new(1)),
             db: db.clone(),
             settings: settings.clone(),
             baseline_registry: Arc::new(BaselineRegistry::new(&repo, None)?),
@@ -3411,7 +3396,6 @@ mod tests {
             review_id,
             None,
             provider,
-            Arc::new(Semaphore::new(56)),
         )
         .await
     }
@@ -3603,7 +3587,6 @@ sleep 30
                 review_id,
                 None,
                 provider,
-                Arc::new(Semaphore::new(56)),
             ),
         )
         .await;
@@ -3701,7 +3684,6 @@ fi
         db.migrate().await?;
         Ok(ReviewContext {
             semaphore: Arc::new(Semaphore::new(1)),
-            llm_semaphore: Arc::new(Semaphore::new(1)),
             db,
             settings,
             baseline_registry: Arc::new(BaselineRegistry::new(repo, None)?),
@@ -3836,7 +3818,6 @@ fi
 
         let ctx = ReviewContext {
             semaphore: Arc::new(Semaphore::new(1)),
-            llm_semaphore: Arc::new(Semaphore::new(56)),
             db: db.clone(),
             settings: settings.clone(),
             baseline_registry: Arc::new(BaselineRegistry::new(Path::new("."), None).unwrap()),
@@ -4119,7 +4100,6 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
             review_id,
             None,
             provider,
-            Arc::new(Semaphore::new(56)),
         )
         .await
         .map(|_| ())
@@ -4231,7 +4211,6 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
 
         let ctx = ReviewContext {
             semaphore: Arc::new(Semaphore::new(1)),
-            llm_semaphore: Arc::new(Semaphore::new(56)),
             db: db.clone(),
             settings,
             baseline_registry: Arc::new(
@@ -4557,7 +4536,6 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
 
         let ctx = ReviewContext {
             semaphore: Arc::new(Semaphore::new(1)),
-            llm_semaphore: Arc::new(Semaphore::new(56)),
             db: db.clone(),
             settings,
             baseline_registry: Arc::new(

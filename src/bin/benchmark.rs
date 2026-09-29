@@ -275,7 +275,14 @@ async fn main() -> Result<()> {
 
     // --- Phase 3: Evaluate Results ---
     info!("--- Phase 3: Evaluating Results ---");
-    let ai_provider = create_provider(&settings).context("Failed to create AI provider")?;
+    // Sized from the same setting the daemon would use, so the judge's calls
+    // count against the same kind of ceiling as the reviews it scores.
+    sashiko::ai::concurrency_limited_provider::init_llm_gate(settings.ai.max_concurrent_requests);
+    let ai_provider: Arc<dyn sashiko::ai::AiProvider> = Arc::new(
+        sashiko::ai::concurrency_limited_provider::ConcurrencyLimitedProvider::new(
+            create_provider(&settings).context("Failed to create AI provider")?,
+        ),
+    );
     let processed_count = Arc::new(AtomicUsize::new(0));
     let concurrency = settings.review.concurrency;
     info!("Running evaluation with concurrency: {}", concurrency);

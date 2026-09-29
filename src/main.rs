@@ -397,6 +397,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Every model call this process makes - reviews, bug analyses, the
+    // bug-filing endpoint - draws on one gate, sized before any of them
+    // starts.
+    sashiko::ai::concurrency_limited_provider::init_llm_gate(settings.ai.max_concurrent_requests);
+
     // The resolved project is the answer to the flag, the environment and the
     // file together. Writing it back means everything reading the settings
     // from here on, including the reviewer that has to pass it to its worker
@@ -980,8 +985,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let bug_worker_handle = {
-        let provider =
-            sashiko::ai::create_provider(&settings).expect("Provider setup failed for bug worker");
+        // Wrapped, so bug analyses count against the same in-flight ceiling
+        // as reviews instead of adding requests on top of it.
+        let provider: std::sync::Arc<dyn sashiko::ai::AiProvider> = std::sync::Arc::new(
+            sashiko::ai::concurrency_limited_provider::ConcurrencyLimitedProvider::new(
+                sashiko::ai::create_provider(&settings)
+                    .expect("Provider setup failed for bug worker"),
+            ),
+        );
         let bug_worker = sashiko::worker::bug_worker::BugWorker::new(
             db.clone(),
             provider,

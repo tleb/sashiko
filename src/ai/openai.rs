@@ -19,10 +19,12 @@ use crate::ai::{
 use crate::utils::redact_secret;
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::StreamExt;
 use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -44,6 +46,14 @@ pub struct OpenAiRequest {
     /// Omitted when not configured; other endpoints ignore the field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderRouting>,
+    /// Always true: completions are read as an SSE delta stream. A buffered
+    /// response stays silent for the whole generation, and gateways cut
+    /// silent connections minutes in (observed on z.ai's coding endpoint at
+    /// ~4.5 min), losing everything the model produced.
+    pub stream: bool,
+    /// Asks the endpoint to report token usage in a final stream chunk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -143,6 +153,8 @@ where
     Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
+static RETRY_AFTER_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+
 #[derive(Debug, thiserror::Error)]
 pub enum OpenAiCompatError {
     #[error("Rate limit exceeded, retry after {0:?}")]
@@ -168,6 +180,221 @@ impl ClassifyAiError for OpenAiCompatError {
             OpenAiCompatError::ApiError(status, _) => {
                 classify_status_code(*status).unwrap_or(AiErrorClass::Fatal)
             }
+        }
+    }
+}
+
+/// Formats an error together with its source chain. A reqwest Display alone
+/// reads "error sending request for url (...)" whether the request timed
+/// out, the connection was reset, or DNS failed; the cause is the only part
+/// that says which.
+fn format_error_chain(err: &dyn std::error::Error) -> String {
+    let mut chain = redact_secret(&err.to_string());
+    let mut source = err.source();
+    while let Some(link) = source {
+        chain.push_str(": ");
+        chain.push_str(&redact_secret(&link.to_string()));
+        source = link.source();
+    }
+    chain
+}
+
+/// True when the endpoint answered 400 naming stream_options, meaning it
+/// rejects the field rather than ignoring it; the call is retried without.
+fn rejects_stream_options(error: &OpenAiCompatError) -> bool {
+    let OpenAiCompatError::ApiError(status, body) = error else {
+        return false;
+    };
+    if !matches!(
+        *status,
+        reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    ) {
+        return false;
+    }
+    body.to_ascii_lowercase().contains("stream_options")
+}
+
+/// One `data:` event of a streamed completion: an incremental delta rather
+/// than a whole message. Every field is optional, and an endpoint reports
+/// whichever it sends.
+#[derive(Debug, Deserialize)]
+struct OpenAiStreamChunk {
+    #[serde(default)]
+    choices: Vec<OpenAiStreamChoice>,
+    /// Present whole in a final chunk when the endpoint honours
+    /// stream_options.include_usage; absent otherwise.
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiStreamChoice {
+    #[serde(default)]
+    delta: OpenAiStreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OpenAiStreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+    /// Deltas of one tool call, addressed by position: the first fragment
+    /// carries the id and name, later ones only argument bytes.
+    #[serde(default)]
+    tool_calls: Option<Vec<OpenAiStreamToolCall>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OpenAiStreamToolCall {
+    #[serde(default)]
+    index: u32,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<OpenAiStreamFunctionDelta>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OpenAiStreamFunctionDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+/// A tool call reassembled from its stream fragments, keyed by the index the
+/// endpoint addresses fragments with.
+#[derive(Default)]
+struct StreamedToolCall {
+    id: Option<String>,
+    function_name: String,
+    arguments: String,
+}
+
+/// Accumulates stream deltas into the whole-message shape the buffered path
+/// already knows how to translate.
+#[derive(Default)]
+struct StreamedResponse {
+    content: String,
+    finish_reason: Option<String>,
+    tool_calls: BTreeMap<u32, StreamedToolCall>,
+    usage: Option<OpenAiUsage>,
+}
+
+impl StreamedResponse {
+    fn absorb(&mut self, chunk: OpenAiStreamChunk) {
+        // Usage arrives once, whole, in the last chunk; a None earlier in the
+        // stream must not erase it.
+        if chunk.usage.is_some() {
+            self.usage = chunk.usage;
+        }
+        for choice in chunk.choices {
+            if choice.finish_reason.is_some() {
+                self.finish_reason = choice.finish_reason;
+            }
+            if let Some(content) = choice.delta.content {
+                self.content.push_str(&content);
+            }
+            for call in choice.delta.tool_calls.unwrap_or_default() {
+                let entry = self.tool_calls.entry(call.index).or_default();
+                if call.id.is_some() {
+                    entry.id = call.id;
+                }
+                if let Some(function) = call.function {
+                    if let Some(name) = function.name {
+                        entry.function_name.push_str(&name);
+                    }
+                    if let Some(arguments) = function.arguments {
+                        entry.arguments.push_str(&arguments);
+                    }
+                }
+            }
+        }
+    }
+
+    fn into_response(self) -> OpenAiResponse {
+        let tool_calls = (!self.tool_calls.is_empty()).then(|| {
+            self.tool_calls
+                .into_values()
+                .map(|call| OpenAiToolCall {
+                    id: call.id,
+                    tool_type: "function".to_string(),
+                    function: OpenAiToolCallFunction {
+                        name: call.function_name,
+                        arguments: call.arguments,
+                    },
+                })
+                .collect()
+        });
+        OpenAiResponse {
+            choices: vec![OpenAiChoice {
+                index: 0,
+                message: OpenAiMessage {
+                    role: "assistant".to_string(),
+                    content: (!self.content.is_empty()).then_some(self.content),
+                    tool_calls,
+                    tool_call_id: None,
+                },
+                finish_reason: self.finish_reason,
+            }],
+            usage: self.usage.unwrap_or_default(),
+        }
+    }
+
+    /// Whether anything at all arrived. A stream that ends without [DONE]
+    /// and without content, tool calls or a finish marker produced nothing a
+    /// caller could use.
+    fn is_empty(&self) -> bool {
+        self.content.is_empty()
+            && self.tool_calls.is_empty()
+            && self.finish_reason.is_none()
+            && self.usage.is_none()
+    }
+}
+
+/// Pulls every complete line out of a byte buffer, leaving any trailing
+/// partial line for the next network chunk.
+fn drain_complete_lines(buffer: &mut Vec<u8>) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+        let mut line: Vec<u8> = buffer.drain(..=pos).collect();
+        line.pop();
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        lines.push(String::from_utf8_lossy(&line).into_owned());
+    }
+    lines
+}
+
+/// Feeds one SSE line into the accumulator. Returns true on the [DONE]
+/// terminator. Lines other than `data:` (comments, event names) are ignored.
+fn absorb_sse_line(line: &str, response: &mut StreamedResponse) -> Result<bool, OpenAiCompatError> {
+    let Some(data) = line.strip_prefix("data:") else {
+        return Ok(false);
+    };
+    let data = data.trim_start();
+    if data.is_empty() || data == "[DONE]" {
+        return Ok(data == "[DONE]");
+    }
+    match serde_json::from_str::<OpenAiStreamChunk>(data) {
+        Ok(chunk) => {
+            response.absorb(chunk);
+            Ok(false)
+        }
+        Err(e) => {
+            tracing::error!(
+                "Failed to decode OpenAI stream chunk: {} around line {} column {}:\n  {}",
+                e,
+                e.line(),
+                e.column(),
+                redact_secret(&json_error_excerpt(data, e.line(), e.column()))
+            );
+            Err(OpenAiCompatError::TransientError(
+                Duration::ZERO,
+                format!("Stream chunk parse error: {e}"),
+            ))
         }
     }
 }
@@ -229,6 +456,7 @@ pub struct OpenAiCompatClient {
     provider_routing: Option<ProviderRouting>,
     client: Client,
     temperature_unsupported: AtomicBool,
+    stream_options_unsupported: AtomicBool,
 }
 
 impl OpenAiCompatClient {
@@ -253,11 +481,16 @@ impl OpenAiCompatClient {
             headers.insert("Authorization", value);
         }
 
+        // No total timeout: a streamed generation legitimately runs for
+        // minutes, and cutting it mid-flight wastes everything the model
+        // produced. Instead the connect is bounded, and read_timeout bounds
+        // every individual socket read: a stream that stays silent for
+        // api_timeout_secs (headers included, so prefill is covered) is dead.
         let client = reqwest::Client::builder()
             .default_headers(headers)
-            .timeout(Duration::from_secs(api_timeout_secs))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .connect_timeout(Duration::from_secs(api_timeout_secs.min(30)))
+            .read_timeout(Duration::from_secs(api_timeout_secs))
+            .build()?;
 
         let base_url = Self::normalize_base_url(&base_url)?;
 
@@ -270,6 +503,7 @@ impl OpenAiCompatClient {
             provider_routing,
             client,
             temperature_unsupported: AtomicBool::new(false),
+            stream_options_unsupported: AtomicBool::new(false),
         })
     }
 
@@ -279,6 +513,9 @@ impl OpenAiCompatClient {
         openai_req.provider = self.provider_routing.clone();
         if self.temperature_unsupported.load(Ordering::Relaxed) {
             openai_req.temperature = None;
+        }
+        if self.stream_options_unsupported.load(Ordering::Relaxed) {
+            openai_req.stream_options = None;
         }
         Ok(openai_req)
     }
@@ -347,12 +584,14 @@ impl OpenAiCompatClient {
     }
 
     async fn post_request(&self, body: &Value) -> Result<OpenAiResponse, OpenAiCompatError> {
-        let re = Regex::new(r"Please retry in ([0-9.]+)s").unwrap();
+        let re = RETRY_AFTER_RE.get_or_init(|| {
+            Regex::new(r"Please retry in ([0-9.]+)s").expect("static retry-after regex")
+        });
 
         let res = match self.client.post(&self.base_url).json(body).send().await {
             Ok(res) => res,
             Err(e) => {
-                let err_str = redact_secret(&e.to_string());
+                let err_str = format_error_chain(&e);
                 tracing::error!("OpenAI request failed (transport): {}", err_str);
                 return Err(OpenAiCompatError::TransientError(
                     Duration::from_secs(30),
@@ -362,36 +601,18 @@ impl OpenAiCompatClient {
         };
 
         if res.status().is_success() {
-            let status = res.status();
-            let body_text = res.text().await.map_err(|e| {
-                let err_str = redact_secret(&e.to_string());
-                tracing::error!("Failed to read OpenAI response body: {}", err_str);
-                OpenAiCompatError::TransientError(Duration::from_secs(30), err_str)
-            })?;
-            match serde_json::from_str::<OpenAiResponse>(&body_text) {
-                Ok(response) => {
-                    tracing::info!(
-                        "OpenAI response received. Tokens: in={}, out={}",
-                        response.usage.prompt_tokens,
-                        response.usage.completion_tokens
-                    );
-                    return Ok(response);
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to decode OpenAI response: {}\n  around line {} column {} of {} byte body:\n  {}",
-                        e,
-                        e.line(),
-                        e.column(),
-                        body_text.len(),
-                        redact_secret(&json_error_excerpt(&body_text, e.line(), e.column()))
-                    );
-                    return Err(OpenAiCompatError::ApiError(
-                        status,
-                        format!("Parse error: {}", e),
-                    ));
-                }
-            }
+            let streamed = res
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.to_ascii_lowercase().contains("text/event-stream"));
+            return if streamed {
+                self.read_streamed_response(res).await
+            } else {
+                // The endpoint ignored stream: true and buffered the whole
+                // completion; read it as the plain JSON it answered with.
+                self.read_buffered_response(res).await
+            };
         }
 
         let status = res.status();
@@ -429,6 +650,90 @@ impl OpenAiCompatClient {
             }
             _ => Err(OpenAiCompatError::ApiError(status, error_text))?,
         }
+    }
+
+    /// Reads a 200 response the endpoint buffered instead of streaming, as
+    /// plain JSON. Kept because an OpenAI-compatible server is free to ignore
+    /// the stream flag.
+    async fn read_buffered_response(
+        &self,
+        res: reqwest::Response,
+    ) -> Result<OpenAiResponse, OpenAiCompatError> {
+        let status = res.status();
+        let body_text = res.text().await.map_err(|e| {
+            let err_str = format_error_chain(&e);
+            tracing::error!("Failed to read OpenAI response body: {}", err_str);
+            OpenAiCompatError::TransientError(Duration::from_secs(30), err_str)
+        })?;
+        match serde_json::from_str::<OpenAiResponse>(&body_text) {
+            Ok(response) => {
+                tracing::info!(
+                    "OpenAI response received. Tokens: in={}, out={}",
+                    response.usage.prompt_tokens,
+                    response.usage.completion_tokens
+                );
+                Ok(response)
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to decode OpenAI response: {}\n  around line {} column {} of {} byte body:\n  {}",
+                    e,
+                    e.line(),
+                    e.column(),
+                    body_text.len(),
+                    redact_secret(&json_error_excerpt(&body_text, e.line(), e.column()))
+                );
+                Err(OpenAiCompatError::ApiError(
+                    status,
+                    format!("Parse error: {e}"),
+                ))
+            }
+        }
+    }
+
+    /// Reads a 200 response as an SSE delta stream and reassembles the whole
+    /// completion from it.
+    async fn read_streamed_response(
+        &self,
+        res: reqwest::Response,
+    ) -> Result<OpenAiResponse, OpenAiCompatError> {
+        let mut stream = res.bytes_stream();
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut assembled = StreamedResponse::default();
+        let mut done = false;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| {
+                let err_str = format_error_chain(&e);
+                tracing::error!("OpenAI stream failed (transport): {}", err_str);
+                OpenAiCompatError::TransientError(Duration::from_secs(30), err_str)
+            })?;
+            buffer.extend_from_slice(&chunk);
+            for line in drain_complete_lines(&mut buffer) {
+                if absorb_sse_line(&line, &mut assembled)? {
+                    done = true;
+                    break;
+                }
+            }
+            if done {
+                break;
+            }
+        }
+        // A stream that ends without [DONE] is out of protocol, but the
+        // endpoint may still have delivered a complete message; accept it
+        // when anything arrived and only fail on an empty stream.
+        if !done && assembled.is_empty() {
+            return Err(OpenAiCompatError::TransientError(
+                Duration::from_secs(30),
+                "Stream ended before any content arrived".to_string(),
+            ));
+        }
+        let response = assembled.into_response();
+        tracing::info!(
+            "OpenAI response received. Tokens: in={}, out={}",
+            response.usage.prompt_tokens,
+            response.usage.completion_tokens
+        );
+        Ok(response)
     }
 }
 
@@ -573,6 +878,8 @@ fn translate_ai_request(
         max_completion_tokens: max_completion_tokens_field,
         response_format,
         provider: None,
+        stream: true,
+        stream_options: Some(serde_json::json!({ "include_usage": true })),
     })
 }
 
@@ -665,6 +972,17 @@ impl AiProvider for OpenAiCompatClient {
                     crate::ai::get_log_prefix()
                 );
                 openai_req.temperature = None;
+                let retry_body = serde_json::to_value(&openai_req)?;
+                self.post_request(&retry_body).await?
+            }
+            Err(error) if openai_req.stream_options.is_some() && rejects_stream_options(&error) => {
+                self.stream_options_unsupported
+                    .store(true, Ordering::Relaxed);
+                tracing::warn!(
+                    "{}OpenAI endpoint rejected stream_options; retrying without it",
+                    crate::ai::get_log_prefix()
+                );
+                openai_req.stream_options = None;
                 let retry_body = serde_json::to_value(&openai_req)?;
                 self.post_request(&retry_body).await?
             }
@@ -1829,5 +2147,167 @@ mod tests {
         check("Unsupported parameter: 'max_tokens'", Some(0.0)).await?;
         check("Unsupported parameter: 'temperature'", None).await?;
         Ok(())
+    }
+
+    fn chunk(json: serde_json::Value) -> OpenAiStreamChunk {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn test_stream_assembles_content_tool_calls_and_usage() {
+        let mut streamed = StreamedResponse::default();
+        streamed.absorb(chunk(json!({
+            "choices": [{
+                "delta": {
+                    "role": "assistant",
+                    "tool_calls": [{ "index": 0, "id": "call_1",
+                                      "function": { "name": "git_log", "arguments": "{\"n\":" } }]
+                }
+            }]
+        })));
+        streamed.absorb(chunk(json!({
+            "choices": [{
+                "delta": { "content": "Findings: none" }
+            }]
+        })));
+        streamed.absorb(chunk(json!({
+            "choices": [{
+                "delta": { "tool_calls": [{ "index": 0, "function": { "arguments": "5}" } },
+                                              { "index": 1, "id": "call_2",
+                                                "function": { "name": "git_show", "arguments": "{}" } }] },
+                "finish_reason": "tool_calls"
+            }]
+        })));
+        streamed.absorb(chunk(json!({
+            "choices": [],
+            "usage": { "prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18 }
+        })));
+
+        let resp = streamed.into_response();
+        assert_eq!(resp.choices.len(), 1);
+        let message = &resp.choices[0].message;
+        assert_eq!(message.content.as_deref(), Some("Findings: none"));
+        assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("tool_calls"));
+        let calls = message.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 2);
+        // Fragments of one call are concatenated in index order.
+        assert_eq!(calls[0].id.as_deref(), Some("call_1"));
+        assert_eq!(calls[0].function.name, "git_log");
+        assert_eq!(calls[0].function.arguments, r#"{"n":5}"#);
+        assert_eq!(calls[1].id.as_deref(), Some("call_2"));
+        assert_eq!(resp.usage.prompt_tokens, 11);
+        assert_eq!(resp.usage.completion_tokens, 7);
+
+        let ai_resp = translate_ai_response(resp).unwrap();
+        assert_eq!(ai_resp.content.as_deref(), Some("Findings: none"));
+        let ai_calls = ai_resp.tool_calls.unwrap();
+        assert_eq!(ai_calls[0].id, "call_1");
+        assert_eq!(ai_calls[0].arguments["n"], 5);
+        assert!(!ai_resp.truncated);
+    }
+
+    #[test]
+    fn test_drain_complete_lines_keeps_partial_and_strips_cr() {
+        let mut buffer = b"data: one\r\n".to_vec();
+        assert_eq!(drain_complete_lines(&mut buffer), vec!["data: one"]);
+        assert!(buffer.is_empty());
+
+        // A chunk boundary inside a line leaves the fragment buffered.
+        buffer.extend_from_slice(b"data: two");
+        assert!(drain_complete_lines(&mut buffer).is_empty());
+        buffer.extend_from_slice(b" \n: keepalive\n\ndata: ");
+        assert_eq!(
+            drain_complete_lines(&mut buffer),
+            vec!["data: two ", ": keepalive", ""]
+        );
+        assert_eq!(buffer, b"data: ");
+    }
+
+    #[test]
+    fn test_absorb_sse_line_ignores_noise_and_stops_on_done() {
+        let mut streamed = StreamedResponse::default();
+        assert!(!absorb_sse_line(": stream start", &mut streamed).unwrap());
+        assert!(!absorb_sse_line("event: message", &mut streamed).unwrap());
+        assert!(!absorb_sse_line("data:", &mut streamed).unwrap());
+        assert!(streamed.is_empty());
+
+        assert!(
+            !absorb_sse_line(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}",
+                &mut streamed
+            )
+            .unwrap()
+        );
+        assert!(!streamed.is_empty());
+        assert!(absorb_sse_line("data: [DONE]", &mut streamed).unwrap());
+    }
+
+    #[test]
+    fn test_absorb_sse_line_rejects_garbage_data() {
+        let mut streamed = StreamedResponse::default();
+        let err = absorb_sse_line("data: {not json", &mut streamed).unwrap_err();
+        assert!(err.to_string().contains("Stream chunk parse error"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_content_reads_an_sse_stream_end_to_end() -> Result<()> {
+        use axum::{Router, http::header, routing::post};
+        let payload = concat!(
+            ": stream start\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    payload.to_string(),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base_url = format!("http://{}/v1", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let client = OpenAiCompatClient::new(
+            base_url,
+            OpenAiProviderType::OpenAiCompatible,
+            "test-model".to_string(),
+            1000,
+            128,
+            30,
+            None,
+        )?;
+        let resp = client.generate_content(dummy_stream_request()).await?;
+        server.abort();
+
+        assert_eq!(resp.content.as_deref(), Some("Hello"));
+        assert!(resp.tool_calls.is_none());
+        assert!(!resp.truncated);
+        let usage = resp.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 3);
+        assert_eq!(usage.completion_tokens, 2);
+        Ok(())
+    }
+
+    fn dummy_stream_request() -> AiRequest {
+        AiRequest {
+            system: None,
+            messages: vec![AiMessage {
+                role: AiRole::User,
+                content: Some("hi".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+        }
     }
 }

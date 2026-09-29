@@ -100,7 +100,7 @@ Core AI settings that apply to all providers.
 | `max_input_tokens` | integer | `150000` | Maximum input tokens per request. |
 | `max_interactions` | integer | `100` | Maximum tool-call rounds per review turn. |
 | `temperature` | float | `1.0` | Sampling temperature. |
-| `api_timeout_secs` | integer | `300` | Timeout for individual API calls (seconds). |
+| `api_timeout_secs` | integer | `300` | Timeout for the connection plus any silent gap in the streamed response (seconds). A healthy stream may run for many minutes; one that stays silent this long is treated as dead and retried. |
 | `max_concurrent_requests` | integer | `3` | Ceiling on model calls in flight at once, process-wide: reviews, bug analyses and the bug-filing endpoint all draw on the same permits. Raise it to keep the endpoint busy while tools run elsewhere; lower it to stay under a subscription's limits. `0` is treated as `1`. Separate processes (daemon plus a local review) each get their own ceiling. |
 | `log_turns` | bool | `false` | Log each AI request/response turn at info level. Verbose but useful for debugging. |
 | `response_cache` | bool | `false` | Cache AI responses to disk. The daemon keeps the cache beside its database; a local review, which has none, keeps it under `$XDG_DATA_HOME/sashiko/`. Entries are keyed on the provider's own settings as well as the request, so changing `model`, an endpoint, a reasoning level, or an output cap misses the entries recorded under the old value rather than replaying them. |

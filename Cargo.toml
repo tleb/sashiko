@@ -64,7 +64,7 @@ lettre = { version = "0.11.7", default-features = false, features = ["builder", 
 libsql = "0.9.29"
 mail-parser = "0.11.3"
 regex = "1.12.2"
-reqwest = { version = "0.13.1", features = ["json", "query"] }
+reqwest = { version = "0.13.1", features = ["json", "query", "stream"] }
 rustix = { version = "1.1.4", features = ["termios"] }
 rustls-native-certs = "0.8.4"
 serde = { version = "1.0.228", features = ["derive"] }

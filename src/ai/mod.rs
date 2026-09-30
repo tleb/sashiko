@@ -283,6 +283,9 @@ pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
     if let Some(e) = error.downcast_ref::<claude_cli::ClaudeCliError>() {
         return e.ai_error_class();
     }
+    if let Some(e) = error.downcast_ref::<pi_cli::PiCliError>() {
+        return e.ai_error_class();
+    }
     if let Some(e) = error.downcast_ref::<gemini::GeminiError>() {
         return e.ai_error_class();
     }
@@ -642,6 +645,15 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
             model: ai.model.clone(),
             effort: ai.codex_cli.as_ref().and_then(|c| c.effort.clone()),
         })),
+        "pi-cli" => Ok(Arc::new(pi_cli::PiCliProvider {
+            model: ai.model.clone(),
+            binary: ai
+                .pi_cli
+                .as_ref()
+                .and_then(|c| c.binary.clone())
+                .unwrap_or_else(|| "pi".to_string()),
+            timeout_secs: pi_cli::CALL_TIMEOUT_SECS,
+        })),
         "copilot-cli" => Ok(Arc::new(copilot_cli::CopilotCliProvider {
             model: ai.model.clone(),
         })),
@@ -726,6 +738,7 @@ pub mod kiro_cli;
 pub mod logging_provider;
 pub mod ollama;
 pub mod openai;
+pub mod pi_cli;
 pub mod proxy;
 pub mod quota;
 pub mod session;

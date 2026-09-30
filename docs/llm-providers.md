@@ -308,6 +308,32 @@ request, which costs roughly 5k tokens before Sashiko's prompt is even
 counted. Set `max_input_tokens` well below `context_window_size` so a review
 prompt plus that overhead still fits.
 
+## pi CLI
+
+Uses a local [pi](https://github.com/earendil-works/pi-mono) installation as
+the completion backend. This rides on pi's own provider setup - a coding
+subscription like z.ai's, an OpenAI-compatible endpoint, anything pi has
+configured - with its streaming, retries and credentials, instead of
+sashiko's HTTP clients.
+
+**Prerequisites:** Install the `pi` CLI and configure a provider
+(`pi auth` to check).
+
+**Apply the example config:**
+
+```bash
+cp docs/examples/Settings.pi-cli.toml Settings.toml
+```
+
+**What you get:**
+
+- Runs `pi -p --mode json` with every tool, session, extension, skill
+  and context-file discovery disabled: a stateless text-completion
+  backend, same safety posture as the claude CLI provider
+- Prompt sent via stdin, so no `ARG_MAX` limit on review-sized prompts
+- An empty `[ai] model` means "whatever pi defaults to"; set it to pin one
+- Token usage from pi's event stream feeds sashiko's accounting
+
 ## Codex CLI
 
 Uses a local [Codex CLI](https://github.com/openai/codex) (OpenAI)

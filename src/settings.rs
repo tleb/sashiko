@@ -486,6 +486,18 @@ pub struct CodexCliSettings {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
+pub struct PiCliSettings {
+    /// Path of the pi binary. Defaults to "pi" on PATH; tests point it at
+    /// a fake. The provider resolves providers, endpoints and credentials
+    /// through pi's own configuration (~/.pi/agent/), so nothing of sashiko's
+    /// [ai] endpoint settings applies to it beyond the model name.
+    #[serde(default)]
+    pub binary: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+#[allow(unused)]
 pub struct DevinCliSettings {
     /// Path to a Devin declarative agent config file (JSON or YAML) passed via
     /// `--agent-config`. Use this to disable all tools for a strictly
@@ -543,6 +555,7 @@ pub struct AiSettings {
     pub goose_cli: Option<GooseCliSettings>,
     pub claude_cli: Option<ClaudeCliSettings>,
     pub codex_cli: Option<CodexCliSettings>,
+    pub pi_cli: Option<PiCliSettings>,
     pub devin_cli: Option<DevinCliSettings>,
 }
 

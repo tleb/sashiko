@@ -410,7 +410,8 @@ fn validate_concerns_output(
 
 fn format_concerns_feedback(violation: &str) -> String {
     format!(
-        "\n\nPrevious attempt was rejected: {}. You MUST return ONLY a JSON object containing 'concerns' and 'dismissed_concerns' arrays. If there are no concerns and no dismissed concerns, return `{{\"concerns\": [], \"dismissed_concerns\": []}}`.",
+        "\n\nPrevious attempt was rejected: {}. You MUST return ONLY a JSON object containing 'concerns' and 'dismissed_concerns' arrays. If there are no concerns and no dismissed concerns, return `{{\"concerns\": [], \"dismissed_concerns\": []}}`.\n\
+         The response must start with '{{' and contain nothing else — no prose before or after, no markdown fences, no XML tags. Answer from the context already gathered; do not re-investigate.",
         violation
     )
 }

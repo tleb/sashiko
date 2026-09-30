@@ -142,10 +142,26 @@ where
             Self::Text {
                 feedback_formatter, ..
             } => feedback_formatter(violation),
-            _ => format!(
-                "Previous attempt was rejected: {}. Please correct your output format.",
-                violation
-            ),
+            _ => {
+                // Schema-less formats keep the generic nudge.
+                let Some(schema) =
+                    self.schema().and_then(|s| serde_json::to_string(s).ok())
+                else {
+                    return format!(
+                        "Previous attempt was rejected: {violation}. Please correct your output format."
+                    );
+                };
+                // The schema is restated on every repair: the initial
+                // prompt is turns away by now, and the observed failure
+                // modes were exactly "no shape given, none followed".
+                format!(
+                    "Previous attempt was rejected: {violation}.\n\
+                     Respond with ONLY a single valid JSON object matching this schema: {schema}.\n\
+                     The response must start with '{{' and contain nothing else — \
+                     no prose before or after, no markdown fences, no XML tags.\n\
+                     Answer from the context already gathered; do not re-investigate."
+                )
+            }
         }
     }
 
@@ -276,7 +292,7 @@ mod tests {
     use super::*;
     use serde::Deserialize;
 
-    #[derive(Deserialize, Debug, PartialEq)]
+    #[derive(Deserialize, Debug, PartialEq, schemars::JsonSchema)]
     struct DummyOutput {
         name: String,
         count: u32,
@@ -348,5 +364,26 @@ mod tests {
             "violation: {err}"
         );
         assert!(err.contains("missing field"), "violation: {err}");
+    }
+
+    #[test]
+    fn test_repair_feedback_restates_the_schema() {
+        let fmt = OutputFormat::<(), DummyOutput>::json_with_schema(
+            crate::workflow::output::schema_for_type::<DummyOutput>(),
+        );
+        let feedback = fmt.format_feedback("the response contains no JSON object at all");
+        assert!(feedback.contains("Previous attempt was rejected"));
+        assert!(feedback.contains("matching this schema"), "{feedback}");
+        assert!(feedback.contains("\"count\""), "{feedback}");
+        assert!(feedback.contains("must start with '{'"), "{feedback}");
+        assert!(feedback.contains("do not re-investigate"), "{feedback}");
+    }
+
+    #[test]
+    fn test_schemaless_feedback_stays_generic() {
+        let fmt = OutputFormat::<(), DummyOutput>::json();
+        let feedback = fmt.format_feedback("wrong shape");
+        assert!(feedback.contains("Please correct your output format"));
+        assert!(!feedback.contains("matching this schema"));
     }
 }

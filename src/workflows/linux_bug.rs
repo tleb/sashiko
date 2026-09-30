@@ -212,6 +212,7 @@ impl std::fmt::Debug for BugOutcome {
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize, Serialize, Debug, Clone, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct VerificationJson {
     pub verification_reasoning: String,
     pub is_false_positive: bool,
@@ -221,6 +222,7 @@ pub struct VerificationJson {
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct NormalizationJson {
     pub canonical_title: String,
     pub canonical_description: String,
@@ -230,6 +232,7 @@ pub struct NormalizationJson {
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DedupJson {
     pub is_duplicate: bool,
     pub duplicate_of_id: Option<i64>,
@@ -237,11 +240,13 @@ pub struct DedupJson {
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TracingJson {
     pub introducing_commit_sha: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SeverityJson {
     pub severity: String,
     pub severity_explanation: String,

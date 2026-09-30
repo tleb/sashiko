@@ -86,32 +86,33 @@ pub struct LinuxPatchReviewState {
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize, Serialize, Debug, Clone, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PrescreenOutput {
     pub selected_prompts: Vec<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PlanningOutput {
     pub relevant_stages: Vec<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Default, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StageConcernsOutput {
-    #[serde(default)]
     pub concerns: Vec<Value>,
-    #[serde(default)]
     pub dismissed_concerns: Vec<Value>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Default, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ConflictResolutionOutput {
-    #[serde(default)]
     pub concerns: Vec<Value>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Default, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct VerificationOutput {
-    #[serde(default)]
     pub findings: Vec<Value>,
 }
 
@@ -1361,6 +1362,24 @@ mod tests {
         } else {
             panic!("expected planning stage to use json_with_schema");
         }
+    }
+
+    #[test]
+    fn test_concerns_output_rejects_foreign_and_empty_shapes() {
+        // The macb run's stages "finished" with zero concerns because a
+        // tool_calls string or {} deserialized into all-optional fields;
+        // strictness sends that garbage into the repair loop instead.
+        use crate::workflow::output::parse_json_from_text;
+        assert!(parse_json_from_text::<StageConcernsOutput>(r#"{"tool_calls": []}"#).is_err());
+        assert!(parse_json_from_text::<StageConcernsOutput>("{}").is_err());
+        assert!(parse_json_from_text::<StageConcernsOutput>(
+            r#"{"concerns": [], "dismissed_concerns": [], "extra": 1}"#
+        )
+        .is_err());
+        assert!(parse_json_from_text::<StageConcernsOutput>(
+            r#"{"concerns": [], "dismissed_concerns": []}"#
+        )
+        .is_ok());
     }
 
     #[test]

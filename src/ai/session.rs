@@ -151,6 +151,15 @@ pub struct TurnLimitError {
     pub max_turns: usize,
 }
 
+/// Heuristic: does a rejected response look like an attempt to call tools?
+/// The observed shapes carry the tool_calls key or a flattened call object
+/// with function_name — sometimes tag-wrapped or glued after prose.
+fn looks_like_tool_calls(content: &str) -> bool {
+    content.contains("\"tool_calls\"")
+        || content.contains("\"function_name\"")
+        || content.contains("<tool_call")
+}
+
 /// Where a turn's model call goes: a provider-native session that holds
 /// the transcript, or stateless full-history re-sends.
 enum TurnTransport {
@@ -607,6 +616,24 @@ impl<'a> SessionRunner<'a> {
                         );
                     }
                     let feedback = session.format_validation_feedback(&violation);
+                    // A rejected response that looks like tool calls is its
+                    // own failure family: the model tried to call tools and
+                    // fumbled the envelope (flattened arguments, glued
+                    // prose, an unclosed tag). Name the expected shape so
+                    // the retry fixes the protocol, not the content.
+                    let feedback = match resp.content.as_deref() {
+                        Some(content) if looks_like_tool_calls(content) => format!(
+                            "{feedback}\n\n\
+                             Your previous response looks like an attempt to call tools, \
+                             but it did not follow the protocol ({violation}). \
+                             Tool calls must be ONE JSON object: \
+                             {{\"tool_calls\": [{{\"id\": \"c1\", \"function_name\": \"TOOL_NAME\", \"arguments\": {{...}}}}]}}, \
+                             with every call's parameters nested under \"arguments\". \
+                             Either resend the tool calls in exactly that shape, \
+                             or produce your final JSON answer."
+                        ),
+                        _ => feedback,
+                    };
                     let msg = AiMessage {
                         role: AiRole::User,
                         content: Some(feedback),
@@ -1072,9 +1099,17 @@ mod tests {
             response: &AiResponse,
         ) -> Result<Self::Output, ValidationError> {
             let text = response.content.as_deref().unwrap_or_default();
-            serde_json::from_str(text).map_err(|e| {
+            let value: Value = serde_json::from_str(text).map_err(|e| {
                 ValidationError::FormatViolation(format!("not valid JSON: {e}"))
-            })
+            })?;
+            if value.get("ok").is_none() {
+                return Err(ValidationError::FormatViolation(
+                    "the response contains JSON but it does not match the \
+                     expected shape: missing field ok"
+                        .into(),
+                ));
+            }
+            Ok(value)
         }
     }
 
@@ -1144,5 +1179,51 @@ mod tests {
             state.deltas.lock().unwrap().is_empty(),
             "no native sends must happen after a failed open"
         );
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_intent_gets_protocol_feedback() {
+        // The observed failure family: a tool-call attempt with the
+        // arguments flattened into the call object, which parses as JSON
+        // but matches no stage schema. The repair feedback must explain
+        // the tool-call envelope, not just the schema violation.
+        let provider = ScriptedProvider::new(vec![
+            ScriptedTurn::Response(content_response(
+                r#"{"tool_calls": [{"id": "c1", "function_name": "git_grep", "pattern": "num_queues"}]}"#,
+            )),
+            ScriptedTurn::Response(content_response("{\"ok\": true}")),
+        ]);
+        let runner = SessionRunner::new(&provider);
+        let mut session = JsonOnlySession;
+
+        let res = runner.run(&mut session).await.unwrap();
+
+        assert_eq!(res.output["ok"], serde_json::json!(true));
+        let feedback = res
+            .history
+            .iter()
+            .find(|m| {
+                m.role == AiRole::User
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.contains("attempt to call tools"))
+            })
+            .expect("protocol feedback recorded");
+        let text = feedback.content.as_deref().unwrap_or_default();
+        assert!(text.contains("\"tool_calls\""), "feedback: {text}");
+        assert!(text.contains("nested under \"arguments\""), "feedback: {text}");
+    }
+
+    #[test]
+    fn test_looks_like_tool_calls_matches_the_observed_shapes() {
+        for shape in [
+            r#"I'll check.{"tool_calls": [{"id": "c1"}]}"#, // glued prose
+            r#"{"id": "g3", "function_name": "git_grep"}"#, // flattened args
+            "<tool_call id=\"c1\">",                          // tag echo
+        ] {
+            assert!(looks_like_tool_calls(shape), "shape: {shape}");
+        }
+        assert!(!looks_like_tool_calls("I'll analyze this patch."));
+        assert!(!looks_like_tool_calls(r#"{"ok": true}"#));
     }
 }

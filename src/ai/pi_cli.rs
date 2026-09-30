@@ -95,9 +95,10 @@ pub struct PiCliProvider {
     pub model: String,
     /// Binary to run, overridable so tests can point at a fake.
     pub binary: String,
-    /// Where pi writes its session file, for visualising runs: None keeps
-    /// every call ephemeral, "default" is pi's own session store, anything
-    /// else is a directory. See PiCliSettings.session_dir.
+    /// Where pi writes its session file, for visualising runs: None uses
+    /// pi's own global session store (~/.pi/agent/sessions/), "default" is
+    /// a synonym, anything else is a directory. See PiCliSettings.
+    /// Sessions always persist: the native-session support builds on them.
     pub session_dir: Option<String>,
     /// Thinking level passed as `--thinking`; None keeps pi's own default.
     pub thinking_level: Option<String>,
@@ -127,19 +128,18 @@ impl PiCliProvider {
             cmd.args(["--thinking", level]);
         }
         match self.session_dir.as_deref() {
-            None => {
-                cmd.arg("--no-session");
-            }
+            // Unset keeps pi's own global store (~/.pi/agent/sessions/):
+            // sessions always persist — the native-session support relies
+            // on it, and ephemeral calls left no trail to debug.
+            None => {}
             Some("default") => {}
             Some(dir) => {
                 cmd.args(["--session-dir", dir]);
             }
         }
         // A name carrying the patch and stage makes the session findable in
-        // pi's list; it only makes sense when a session is written at all.
-        if self.session_dir.is_some()
-            && let Some(name) = session_name
-        {
+        // pi's list.
+        if let Some(name) = session_name {
             cmd.args(["--name", name]);
         }
         if !self.model.is_empty() {
@@ -579,7 +579,6 @@ mod tests {
         let args = std::fs::read_to_string(temp.path().join("args.txt")).unwrap();
         for flag in [
             "--no-tools",
-            "--no-session",
             "--no-extensions",
             "--no-skills",
             "--no-context-files",
@@ -587,9 +586,11 @@ mod tests {
         ] {
             assert!(args.contains(flag), "missing {flag} in: {args}");
         }
+        assert!(args.contains("--name"), "sessions are always named now");
         assert!(!args.contains("--model"), "empty model must stay unset");
-        // Ephemeral by default: no name, nothing to find in a session list.
-        assert!(!args.contains("--name"));
+        // Unset session_dir means pi's own global store: no --no-session
+        // escape hatch, no explicit --session-dir either.
+        assert!(!args.contains("--no-session"));
         assert!(!args.contains("--session-dir"));
         Ok(())
     }

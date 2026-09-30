@@ -500,9 +500,13 @@ pub struct PiCliSettings {
     #[serde(default)]
     pub thinking_level: Option<String>,
     /// Where pi writes the session file of each completion, so runs can be
-    /// visualised afterwards (pi --export, /resume, tail). Unset keeps every
-    /// call ephemeral; "default" uses pi's own session store
-    /// (~/.pi/agent/sessions/); any other value is a directory to use.
+    /// visualised afterwards (pi --export, /resume, tail). Unset uses pi's
+    /// own global session store (~/.pi/agent/sessions/); "default" is a
+    /// synonym; any other value is a directory to use. Sessions always
+    /// persist: the native-session support builds on them. Note the
+    /// session file contains the prompt, i.e. the patch under review -
+    /// keep embargoed material in mind before pointing this at a shared
+    /// location.
     #[serde(default)]
     pub session_dir: Option<String>,
 }

@@ -32,9 +32,9 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::time::timeout;
+use tokio::time::{Instant, sleep_until, timeout};
 use tracing::debug;
 
 use crate::ai::claude_cli::build_prompt;
@@ -43,16 +43,25 @@ use crate::ai::{
     AiErrorClass, AiProvider, AiRequest, AiResponse, AiUsage, ClassifyAiError, ProviderCapabilities,
 };
 
-/// Hard ceiling per CLI call, matching the claude CLI provider: pi retries
-/// transport failures itself, so a call that exceeds this is stuck, not slow.
-pub const CALL_TIMEOUT_SECS: u64 = 600;
+/// Hard ceiling per CLI call, as a backstop behind IDLE_TIMEOUT_SECS: a
+/// model that streams forever still dies, bounded well under the review
+/// timeout. A merely slow model that keeps emitting deltas is never killed
+/// by this on its own.
+pub const CALL_TIMEOUT_SECS: u64 = 1800;
+
+/// Kill a call whose event stream goes silent for this long. Healthy
+/// generation emits message_update deltas tens of milliseconds apart, so
+/// silence means a wedged stream, not slow thinking.
+pub const IDLE_TIMEOUT_SECS: u64 = 90;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PiCliError {
     #[error("Failed to spawn pi CLI: {0}")]
     Spawn(String),
-    #[error("pi CLI timed out after {0} minutes")]
+    #[error("pi CLI timed out after {0}s")]
     Timeout(u64),
+    #[error("pi CLI stream stalled for {0}s (killed at {1}s elapsed)")]
+    Stalled(u64, u64),
     #[error("pi CLI wait error: {0}")]
     Wait(String),
     #[error("pi CLI error: {0}")]
@@ -65,7 +74,7 @@ impl ClassifyAiError for PiCliError {
     fn ai_error_class(&self) -> AiErrorClass {
         match self {
             PiCliError::Spawn(_) => AiErrorClass::Fatal,
-            PiCliError::Timeout(_) => AiErrorClass::Transient {
+            PiCliError::Timeout(_) | PiCliError::Stalled(_, _) => AiErrorClass::Transient {
                 retry_after: Duration::from_secs(30),
             },
             PiCliError::Wait(_) => AiErrorClass::Transient {
@@ -87,7 +96,10 @@ pub struct PiCliProvider {
     /// every call ephemeral, "default" is pi's own session store, anything
     /// else is a directory. See PiCliSettings.session_dir.
     pub session_dir: Option<String>,
+    /// Hard per-call budget; the backstop behind idle_secs.
     pub timeout_secs: u64,
+    /// No-progress limit: killed when no stream delta arrives for this long.
+    pub idle_secs: u64,
 }
 
 impl PiCliProvider {
@@ -131,6 +143,108 @@ impl PiCliProvider {
             .kill_on_drop(true);
         cmd
     }
+
+    /// Reads the CLI's stdout event stream until the process exits, under
+    /// two budgets: the hard per-call ceiling (timeout_secs) and the
+    /// no-progress limit (idle_secs). Only streamed deltas reset the
+    /// no-progress timer, so a slow model that keeps thinking is never
+    /// killed while a silent stream is. Returns the raw event stream, the
+    /// drained stderr and the exit status.
+    async fn read_to_completion(
+        &self,
+        mut child: tokio::process::Child,
+    ) -> Result<(String, String, std::process::ExitStatus), PiCliError> {
+        // Piped by command(), the only constructor of the child.
+        let stdout = child
+            .stdout
+            .take()
+            .expect("pi CLI child always pipes stdout");
+        let stderr = child
+            .stderr
+            .take()
+            .expect("pi CLI child always pipes stderr");
+
+        // Drain stderr concurrently: the child blocks once the pipe fills,
+        // and its output is only needed for error reporting.
+        let stderr_task = tokio::spawn(async move {
+            let mut collected = String::new();
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if !line.trim().is_empty() {
+                    debug!("[pi-cli stderr] {line}");
+                }
+                collected.push_str(&line);
+                collected.push('\n');
+            }
+            collected
+        });
+
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(self.timeout_secs);
+        let mut idle_deadline = started + Duration::from_secs(self.idle_secs);
+        let mut lines = BufReader::new(stdout).lines();
+        let mut events = String::new();
+
+        let status = loop {
+            let total = sleep_until(deadline);
+            tokio::pin!(total);
+            let idle = sleep_until(idle_deadline);
+            tokio::pin!(idle);
+            tokio::select! {
+                line = lines.next_line() => match line {
+                    Ok(Some(line)) => {
+                        if is_progress_event(&line) {
+                            idle_deadline =
+                                Instant::now() + Duration::from_secs(self.idle_secs);
+                        }
+                        events.push_str(&line);
+                        events.push('\n');
+                    }
+                    // The stream ended; only the exit status is missing.
+                    Ok(None) => {
+                        let status = self.await_exit(child, deadline).await;
+                        break status;
+                    }
+                    Err(e) => return Err(PiCliError::Wait(e.to_string())),
+                },
+                _ = &mut idle => {
+                    let _ = child.start_kill();
+                    return Err(PiCliError::Stalled(
+                        self.idle_secs,
+                        started.elapsed().as_secs(),
+                    ));
+                }
+                _ = &mut total => {
+                    let _ = child.start_kill();
+                    return Err(PiCliError::Timeout(self.timeout_secs));
+                }
+            }
+        };
+
+        // The child has exited, so its pipes close; this cannot hang long.
+        let stderr = match timeout(Duration::from_secs(5), stderr_task).await {
+            Ok(Ok(stderr)) => stderr,
+            _ => String::new(),
+        };
+        Ok((events, stderr, status?))
+    }
+
+    /// Waits for the child's exit under the remaining call budget: a child
+    /// that closed its stream but never exits must not outlive the ceiling.
+    async fn await_exit(
+        &self,
+        mut child: tokio::process::Child,
+        deadline: Instant,
+    ) -> Result<std::process::ExitStatus, PiCliError> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match timeout(remaining, child.wait()).await {
+            Ok(status) => status.map_err(|e| PiCliError::Wait(e.to_string())),
+            Err(_) => {
+                let _ = child.start_kill();
+                Err(PiCliError::Timeout(self.timeout_secs))
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -153,31 +267,15 @@ impl AiProvider for PiCliProvider {
             stdin.flush().await?;
         }
 
-        let output = timeout(
-            Duration::from_secs(self.timeout_secs),
-            child.wait_with_output(),
-        )
-        .await
-        .map_err(|_| PiCliError::Timeout(self.timeout_secs / 60))?
-        .map_err(|e| PiCliError::Wait(e.to_string()))?;
+        let (stdout, stderr, status) = self.read_to_completion(child).await?;
 
-        for line in String::from_utf8_lossy(&output.stderr).lines() {
-            if !line.trim().is_empty() {
-                debug!("[pi-cli stderr] {line}");
-            }
+        if !status.success() {
+            return Err(
+                PiCliError::Cli(format!("exited with {}: {}", status, stderr.trim())).into(),
+            );
         }
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(PiCliError::Cli(format!(
-                "exited with {}: {}",
-                output.status,
-                stderr.trim()
-            ))
-            .into());
-        }
-
-        let (text, usage, truncated) = parse_events(&String::from_utf8_lossy(&output.stdout))?;
+        let (text, usage, truncated) = parse_events(&stdout)?;
         let mut response = parse_inner_response(&text, usage)?;
         response.truncated = truncated;
         Ok(response)
@@ -208,6 +306,22 @@ fn spawn_retrying(build: impl Fn() -> Command) -> std::io::Result<tokio::process
         }
     }
     Err(last.expect("retry loop ran at least once"))
+}
+
+/// Whether an event line proves the model is still generating: pi's
+/// message_update records exist only for streamed deltas (thinking, text,
+/// tool arguments) and message_end completes a message. Spawn-time events
+/// such as agent_start carry no such proof.
+fn is_progress_event(line: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Event {
+        #[serde(rename = "type")]
+        kind: String,
+    }
+    match serde_json::from_str::<Event>(line) {
+        Ok(event) => matches!(event.kind.as_str(), "message_update" | "message_end"),
+        Err(_) => false,
+    }
 }
 
 /// Extracts the last assistant message from a `pi --mode json` event stream:
@@ -279,7 +393,6 @@ mod tests {
     use crate::ai::classify_ai_error;
     use crate::ai::{AiMessage, AiRole};
     use serde_json::json;
-    use std::io::Write as _;
 
     fn dummy_request() -> AiRequest {
         AiRequest {
@@ -299,28 +412,13 @@ mod tests {
         }
     }
 
-    /// Writes a fake pi binary: it records its arguments, then prints the
-    /// given stdout lines (or sleeps past the timeout). The events land in a
-    /// file the script cats, because pushing JSON through shell quoting gets
-    /// mangled differently by every echo implementation. The script itself
-    /// arrives via write-to-temp plus rename: executing a file that was just
-    /// written can fail with ETXTBSY while the inode still has a writer
-    /// attached.
-    fn fake_pi(dir: &std::path::Path, stdout: &str, exit: Option<&str>) -> std::path::PathBuf {
-        std::fs::write(dir.join("events.jsonl"), stdout).unwrap();
+    /// Writes an executable fake pi running the given shell script body,
+    /// via write-to-temp plus rename: executing a file that was just written
+    /// can fail with ETXTBSY while the inode still has a writer attached.
+    fn script_pi(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
         let path = dir.join("pi");
         let staging = dir.join("pi.tmp");
-        let mut script = String::from("#!/bin/sh\necho \"$@\" > \"$(dirname \"$0\")/args.txt\"\n");
-        if let Some(err) = exit {
-            script.push_str(&format!("echo {err:?} >&2\nexit 1\n"));
-        } else {
-            script.push_str("cat \"$(dirname \"$0\")/events.jsonl\"\n");
-        }
-        {
-            let mut file = std::fs::File::create(&staging).unwrap();
-            file.write_all(script.as_bytes()).unwrap();
-            file.sync_all().unwrap();
-        }
+        std::fs::write(&staging, format!("#!/bin/sh\n{body}")).unwrap();
         std::fs::rename(&staging, &path).unwrap();
         #[cfg(unix)]
         {
@@ -328,6 +426,25 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         path
+    }
+
+    /// A minimal streamed thinking delta, the event that proves a live
+    /// model during a call.
+    fn thinking_delta() -> String {
+        r#"{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","contentIndex":0,"delta":"x"}}"#.to_string()
+    }
+
+    fn fake_pi(dir: &std::path::Path, stdout: &str, exit: Option<&str>) -> std::path::PathBuf {
+        std::fs::write(dir.join("events.jsonl"), stdout).unwrap();
+        // The events land in a file the script cats, because pushing JSON
+        // through shell quoting gets mangled differently by every echo
+        // implementation.
+        let record_args = r#"echo "$@" > "$(dirname "$0")/args.txt""#;
+        let body = match exit {
+            Some(err) => format!("{record_args}\necho {err:?} >&2\nexit 1\n"),
+            None => format!("{record_args}\ncat \"$(dirname \"$0\")/events.jsonl\"\n"),
+        };
+        script_pi(dir, &body)
     }
 
     fn assistant_end(text: &str, usage: &str, stop: &str) -> String {
@@ -352,6 +469,7 @@ mod tests {
             binary: binary.to_string_lossy().into_owned(),
             session_dir: None,
             timeout_secs: CALL_TIMEOUT_SECS,
+            idle_secs: IDLE_TIMEOUT_SECS,
         }
     }
 
@@ -511,34 +629,129 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_a_hung_cli_times_out_as_transient() -> Result<()> {
+    async fn test_a_silent_cli_is_stall_killed_as_transient() -> Result<()> {
         let temp = tempfile::tempdir().unwrap();
-        let pi = fake_pi(temp.path(), "", None);
-        // Overwrite the fake with one that hangs past the tiny timeout, via
-        // write-to-temp plus rename for the same ETXTBSY reason.
-        let staging = temp.path().join("hang.tmp");
-        std::fs::write(&staging, "#!/bin/sh\nsleep 30\n").unwrap();
-        std::fs::rename(&staging, &pi).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&pi, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        let pi = script_pi(temp.path(), "sleep 30\n");
         let provider = PiCliProvider {
             model: String::new(),
             binary: pi.to_string_lossy().into_owned(),
             session_dir: None,
-            timeout_secs: 1,
+            timeout_secs: 60,
+            idle_secs: 1,
         };
         let error = provider
             .generate_content(dummy_request())
             .await
             .unwrap_err();
         assert!(
-            matches!(classify_ai_error(&error), AiErrorClass::Transient { .. }),
-            "a hung CLI must classify as transient, got: {error:#}"
+            matches!(
+                error.downcast_ref::<PiCliError>(),
+                Some(PiCliError::Stalled(..))
+            ),
+            "a silent CLI must stall-kill, got: {error:#}"
+        );
+        assert!(matches!(
+            classify_ai_error(&error),
+            AiErrorClass::Transient { .. }
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_a_stream_that_dries_up_mid_call_is_stall_killed() -> Result<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let delta = thinking_delta();
+        let pi = script_pi(
+            temp.path(),
+            &format!("printf '%s\\n' '{delta}'\nsleep 30\n"),
+        );
+        let provider = PiCliProvider {
+            idle_secs: 1,
+            timeout_secs: 60,
+            ..provider(&pi)
+        };
+        let error = provider
+            .generate_content(dummy_request())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<PiCliError>(),
+                Some(PiCliError::Stalled(..))
+            ),
+            "a dried-up stream must stall-kill, got: {error:#}"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_a_slow_but_streaming_call_is_not_killed() -> Result<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let delta = thinking_delta();
+        let mut body = String::new();
+        for _ in 0..3 {
+            body.push_str(&format!("printf '%s\\n' '{delta}'\nsleep 0.5\n"));
+        }
+        body.push_str(&format!(
+            "printf '%s\\n' '{}'\n",
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"alive"}],"stopReason":"stop"}}"#
+        ));
+        let pi = script_pi(temp.path(), &body);
+        let provider = PiCliProvider {
+            idle_secs: 2,
+            timeout_secs: 60,
+            ..provider(&pi)
+        };
+
+        // 500ms gaps between deltas are far below the 2s stall limit, so the
+        // call must run to completion instead of being killed as stalled.
+        let response = provider.generate_content(dummy_request()).await?;
+        assert_eq!(response.content.as_deref(), Some("alive"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_an_endless_stream_hits_the_hard_cap_as_transient() -> Result<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let delta = thinking_delta();
+        let pi = script_pi(
+            temp.path(),
+            &format!("while :; do printf '%s\\n' '{delta}'\nsleep 0.2\ndone\n"),
+        );
+        let provider = PiCliProvider {
+            timeout_secs: 1,
+            idle_secs: 60,
+            ..provider(&pi)
+        };
+        let error = provider
+            .generate_content(dummy_request())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<PiCliError>(),
+                Some(PiCliError::Timeout(_))
+            ),
+            "an endless stream must hit the ceiling, got: {error:#}"
+        );
+        assert!(matches!(
+            classify_ai_error(&error),
+            AiErrorClass::Transient { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_only_delta_and_end_events_count_as_progress() {
+        assert!(is_progress_event(&thinking_delta()));
+        assert!(is_progress_event(
+            r#"{"type":"message_end","message":{"role":"assistant"}}"#
+        ));
+        assert!(!is_progress_event(r#"{"type":"agent_start"}"#));
+        assert!(!is_progress_event(
+            r#"{"type":"message_start","message":{}}"#
+        ));
+        assert!(!is_progress_event("node: some warning"));
     }
 
     #[test]
@@ -580,6 +793,7 @@ mod tests {
             binary: "pi".to_string(),
             session_dir: None,
             timeout_secs: CALL_TIMEOUT_SECS,
+            idle_secs: IDLE_TIMEOUT_SECS,
         };
         let response = provider.generate_content(dummy_request()).await?;
         assert!(response.content.is_some(), "no content: {response:?}");

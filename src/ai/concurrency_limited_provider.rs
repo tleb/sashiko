@@ -60,6 +60,25 @@ pub fn llm_gate() -> &'static Semaphore {
     })
 }
 
+/// Acquires a permit from the process-wide gate, tracing long waits.
+/// Shared by stateless requests and native-session sends so both draw on
+/// the same permits.
+async fn acquire_gate() -> Result<tokio::sync::SemaphorePermit<'static>> {
+    let started = std::time::Instant::now();
+    let permit = llm_gate()
+        .acquire()
+        .await
+        .map_err(|e| anyhow::anyhow!("concurrency semaphore closed: {e}"))?;
+    let waited = started.elapsed();
+    if waited > std::time::Duration::from_millis(10) {
+        trace::event(
+            "gate_wait",
+            json!({ "waited_ms": waited.as_millis() as u64 }),
+        );
+    }
+    Ok(permit)
+}
+
 /// Limits concurrent model calls to the permits of the process-wide gate. All
 /// other behaviour is delegated unchanged to the inner provider.
 pub struct ConcurrencyLimitedProvider {
@@ -75,19 +94,19 @@ impl ConcurrencyLimitedProvider {
 #[async_trait]
 impl AiProvider for ConcurrencyLimitedProvider {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
-        let started = std::time::Instant::now();
-        let _permit = llm_gate()
-            .acquire()
-            .await
-            .map_err(|e| anyhow::anyhow!("concurrency semaphore closed: {e}"))?;
-        let waited = started.elapsed();
-        if waited > std::time::Duration::from_millis(10) {
-            trace::event(
-                "gate_wait",
-                json!({ "waited_ms": waited.as_millis() as u64 }),
-            );
-        }
+        let _permit = acquire_gate().await?;
         self.inner.generate_content(request).await
+    }
+
+    async fn open_session(
+        &self,
+        request: AiRequest,
+    ) -> Result<Option<Box<dyn crate::ai::ProviderSession>>> {
+        Ok(self
+            .inner
+            .open_session(request)
+            .await?
+            .map(|inner| Box::new(GatedSession(inner)) as Box<dyn crate::ai::ProviderSession>))
     }
 
     fn get_capabilities(&self) -> ProviderCapabilities {
@@ -96,6 +115,22 @@ impl AiProvider for ConcurrencyLimitedProvider {
 
     fn cache_stats(&self) -> Option<CacheStats> {
         self.inner.cache_stats()
+    }
+}
+
+/// A native session whose sends draw on the process-wide gate, one permit
+/// per send, exactly like a stateless request.
+struct GatedSession(Box<dyn crate::ai::ProviderSession>);
+
+#[async_trait]
+impl crate::ai::ProviderSession for GatedSession {
+    async fn send(&mut self, messages: Vec<crate::ai::AiMessage>) -> Result<AiResponse> {
+        let _permit = acquire_gate().await?;
+        self.0.send(messages).await
+    }
+
+    async fn close(self: Box<Self>) -> Result<()> {
+        self.0.close().await
     }
 }
 

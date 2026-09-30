@@ -28,7 +28,67 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tracing::info;
 
-use crate::ai::{AiProvider, AiRequest, AiResponse, CacheStats, ProviderCapabilities};
+use crate::ai::{
+    AiMessage, AiProvider, AiRequest, AiResponse, AiRole, CacheStats, ProviderCapabilities,
+    ProviderSession,
+};
+
+/// Logs the outgoing side of a turn: the newest message being sent.
+fn log_outgoing_turn(turn: u64, tag: &str, messages: &[AiMessage]) {
+    let n_msgs = messages.len();
+    if let Some(last) = messages.last() {
+        let role = format!("{:?}", last.role).to_lowercase();
+        if let Some(tool_calls) = &last.tool_calls {
+            let names: Vec<&str> = tool_calls.iter().map(|t| t.function_name.as_str()).collect();
+            info!("{tag}→ Turn {turn} ({n_msgs} msgs): [{role}] tool_calls={names:?}");
+        } else {
+            let content = last.content.as_deref().unwrap_or("(no text content)");
+            let preview: String = content.chars().take(300).collect();
+            let ellipsis = if content.chars().count() > 300 {
+                "…"
+            } else {
+                ""
+            };
+            info!("{tag}→ Turn {turn} ({n_msgs} msgs): [{role}] {preview}{ellipsis}");
+        }
+    }
+}
+
+/// Logs the incoming side of a turn: text, tool calls and token usage.
+fn log_incoming_turn(turn: u64, tag: &str, response: &AiResponse) {
+    if let Some(content) = &response.content {
+        let preview: String = content.chars().take(500).collect();
+        let ellipsis = if content.chars().count() > 500 {
+            "…"
+        } else {
+            ""
+        };
+        info!("{tag}← Turn {turn} text: {preview}{ellipsis}");
+    }
+    if let Some(tool_calls) = &response.tool_calls {
+        for call in tool_calls {
+            let args = call.arguments.to_string();
+            let preview: String = args.chars().take(200).collect();
+            let ellipsis = if args.chars().count() > 200 {
+                "…"
+            } else {
+                ""
+            };
+            info!(
+                "{tag}← Turn {turn} tool_call: {}({preview}{ellipsis})",
+                call.function_name
+            );
+        }
+    }
+    if let Some(usage) = &response.usage {
+        info!(
+            "{tag}← Turn {turn} tokens: in={} out={} cached={}",
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.cached_tokens.unwrap_or(0)
+        );
+    }
+}
 
 /// Wraps any [`AiProvider`], logging each request/response turn. All other
 /// behaviour is delegated unchanged to the inner provider.
@@ -52,66 +112,27 @@ impl AiProvider for LoggingProvider {
         let turn = self.turn.fetch_add(1, Ordering::SeqCst) + 1;
         // The worker tags requests with their patch context (e.g. "[ps:0 p:1] ").
         let tag = request.context_tag.clone().unwrap_or_default();
-
-        // Log the outgoing request (its most recent message).
-        let n_msgs = request.messages.len();
-        if let Some(last) = request.messages.last() {
-            let role = format!("{:?}", last.role).to_lowercase();
-            if let Some(tool_calls) = &last.tool_calls {
-                let names: Vec<&str> = tool_calls
-                    .iter()
-                    .map(|t| t.function_name.as_str())
-                    .collect();
-                info!("{tag}→ Turn {turn} ({n_msgs} msgs): [{role}] tool_calls={names:?}");
-            } else {
-                let content = last.content.as_deref().unwrap_or("(no text content)");
-                let preview: String = content.chars().take(300).collect();
-                let ellipsis = if content.chars().count() > 300 {
-                    "…"
-                } else {
-                    ""
-                };
-                info!("{tag}→ Turn {turn} ({n_msgs} msgs): [{role}] {preview}{ellipsis}");
-            }
-        }
+        log_outgoing_turn(turn, &tag, &request.messages);
 
         let response = self.inner.generate_content(request).await?;
-
-        // Log the response: text, any tool calls, and token usage.
-        if let Some(content) = &response.content {
-            let preview: String = content.chars().take(500).collect();
-            let ellipsis = if content.chars().count() > 500 {
-                "…"
-            } else {
-                ""
-            };
-            info!("{tag}← Turn {turn} text: {preview}{ellipsis}");
-        }
-        if let Some(tool_calls) = &response.tool_calls {
-            for call in tool_calls {
-                let args = call.arguments.to_string();
-                let preview: String = args.chars().take(200).collect();
-                let ellipsis = if args.chars().count() > 200 {
-                    "…"
-                } else {
-                    ""
-                };
-                info!(
-                    "{tag}← Turn {turn} tool_call: {}({preview}{ellipsis})",
-                    call.function_name
-                );
-            }
-        }
-        if let Some(usage) = &response.usage {
-            info!(
-                "{tag}← Turn {turn} tokens: in={} out={} cached={}",
-                usage.prompt_tokens,
-                usage.completion_tokens,
-                usage.cached_tokens.unwrap_or(0)
-            );
-        }
-
+        log_incoming_turn(turn, &tag, &response);
         Ok(response)
+    }
+
+    async fn open_session(
+        &self,
+        request: AiRequest,
+    ) -> Result<Option<Box<dyn ProviderSession>>> {
+        let tag = request.context_tag.clone().unwrap_or_default();
+        Ok(self
+            .inner
+            .open_session(request)
+            .await?
+            .map(|inner| Box::new(LoggingSession {
+                inner,
+                tag,
+                turn: AtomicU64::new(0),
+            }) as Box<dyn ProviderSession>))
     }
 
     fn get_capabilities(&self) -> ProviderCapabilities {
@@ -120,5 +141,28 @@ impl AiProvider for LoggingProvider {
 
     fn cache_stats(&self) -> Option<CacheStats> {
         self.inner.cache_stats()
+    }
+}
+
+/// A native session logged turn by turn, like a stateless request. Carries
+/// its own counter: native turns and stateless turns number separately.
+struct LoggingSession {
+    inner: Box<dyn ProviderSession>,
+    tag: String,
+    turn: AtomicU64,
+}
+
+#[async_trait]
+impl ProviderSession for LoggingSession {
+    async fn send(&mut self, messages: Vec<AiMessage>) -> Result<AiResponse> {
+        let turn = self.turn.fetch_add(1, Ordering::SeqCst) + 1;
+        log_outgoing_turn(turn, &self.tag, &messages);
+        let response = self.inner.send(messages).await?;
+        log_incoming_turn(turn, &self.tag, &response);
+        Ok(response)
+    }
+
+    async fn close(self: Box<Self>) -> Result<()> {
+        self.inner.close().await
     }
 }

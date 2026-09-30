@@ -198,6 +198,27 @@ impl AiProvider for BackoffProvider {
         trace::scope_ctx(tag, self.generate_with_retries(request)).await
     }
 
+    async fn open_session(
+        &self,
+        request: AiRequest,
+    ) -> Result<Option<Box<dyn crate::ai::ProviderSession>>> {
+        let tag = request.context_tag.clone();
+        let session_tag = tag.clone();
+        trace::scope_ctx(tag, async move {
+            Ok(self.inner.open_session(request).await?.map(|inner| {
+                Box::new(BackoffSession {
+                    inner,
+                    quota: self.quota.clone(),
+                    base_delay: self.base_delay,
+                    max_attempts: self.max_attempts,
+                    budget: self.budget.clone(),
+                    context_tag: session_tag,
+                }) as Box<dyn crate::ai::ProviderSession>
+            }))
+        })
+        .await
+    }
+
     fn get_capabilities(&self) -> ProviderCapabilities {
         self.inner.get_capabilities()
     }
@@ -207,33 +228,129 @@ impl AiProvider for BackoffProvider {
     }
 }
 
+/// A provider-native session wrapped in the same retry policy as a
+/// stateless request: quota waits, budget checks and transient backoff
+/// apply per send, so iterating a session cannot bypass them.
+struct BackoffSession {
+    inner: Box<dyn crate::ai::ProviderSession>,
+    quota: Arc<QuotaManager>,
+    base_delay: Duration,
+    max_attempts: Option<u32>,
+    budget: Option<Arc<dyn RetryBudget>>,
+    context_tag: Option<String>,
+}
+
+#[async_trait]
+impl crate::ai::ProviderSession for BackoffSession {
+    async fn send(&mut self, messages: Vec<crate::ai::AiMessage>) -> Result<AiResponse> {
+        let tag = self.context_tag.clone();
+        trace::scope_ctx(tag, async {
+            run_with_retries(
+                self.quota.clone(),
+                self.base_delay,
+                self.max_attempts,
+                self.budget.clone(),
+                Box::new(SendAttempt {
+                    inner: &mut self.inner,
+                    messages,
+                }),
+            )
+            .await
+        })
+        .await
+    }
+
+    async fn close(self: Box<Self>) -> Result<()> {
+        self.inner.close().await
+    }
+}
+
 impl BackoffProvider {
     async fn generate_with_retries(&self, request: AiRequest) -> Result<AiResponse> {
-        let mut attempt: u32 = 0;
-        let mut transient_streak: i32 = 0;
-        loop {
+        run_with_retries(
+            self.quota.clone(),
+            self.base_delay,
+            self.max_attempts,
+            self.budget.clone(),
+            Box::new(RequestAttempt {
+                inner: self.inner.clone(),
+                request,
+            }),
+        )
+        .await
+    }
+}
+
+/// One retryable model attempt: a stateless request or a native-session
+/// send. A trait (rather than a closure) because the retry loop holds the
+/// attempt across awaits and must stay future-type agnostic.
+#[async_trait]
+trait Attempt {
+    async fn attempt(&mut self) -> Result<AiResponse>;
+}
+
+/// A stateless request replayed verbatim on every retry.
+struct RequestAttempt {
+    inner: Arc<dyn AiProvider>,
+    request: AiRequest,
+}
+
+#[async_trait]
+impl Attempt for RequestAttempt {
+    async fn attempt(&mut self) -> Result<AiResponse> {
+        self.inner.generate_content(self.request.clone()).await
+    }
+}
+
+/// A native-session delta: replayed verbatim while it keeps failing.
+struct SendAttempt<'a> {
+    inner: &'a mut Box<dyn crate::ai::ProviderSession>,
+    messages: Vec<crate::ai::AiMessage>,
+}
+
+#[async_trait]
+impl Attempt for SendAttempt<'_> {
+    async fn attempt(&mut self) -> Result<AiResponse> {
+        self.inner.send(self.messages.clone()).await
+    }
+}
+
+/// The retry loop shared by stateless requests and native-session sends:
+/// honour the quota window, check the caller's budget, run one attempt,
+/// and back off or propagate per the error class. Routing both transports
+/// through one loop keeps their retry policy from drifting apart.
+async fn run_with_retries<'a>(
+    quota: Arc<QuotaManager>,
+    base_delay: Duration,
+    max_attempts: Option<u32>,
+    budget: Option<Arc<dyn RetryBudget>>,
+    mut attempt: Box<dyn Attempt + Send + 'a>,
+) -> Result<AiResponse> {
+    let mut attempt_no: u32 = 0;
+    let mut transient_streak: i32 = 0;
+    loop {
             // Honour any active global rate-limit window before trying. The
             // wait is reported so a caller can keep it off its own deadline.
-            let slept = self.quota.wait_for_access().await;
+            let slept = quota.wait_for_access().await;
             if slept > Duration::ZERO {
                 trace::event(
                     "quota_wait",
                     json!({ "waited_ms": slept.as_millis() as u64 }),
                 );
             }
-            if let Some(budget) = &self.budget {
+            if let Some(budget) = &budget {
                 budget.credit_wait(slept);
                 budget.check()?;
             }
 
             let attempt_started = std::time::Instant::now();
-            match self.inner.generate_content(request.clone()).await {
+            match attempt.attempt().await {
                 Ok(response) => {
-                    self.quota.report_success().await;
+                    quota.report_success().await;
                     trace::event(
                         "llm_attempt",
                         json!({
-                            "attempt": attempt + 1,
+                            "attempt": attempt_no + 1,
                             "duration_ms": attempt_started.elapsed().as_millis() as u64,
                             "outcome": "ok",
                             "tokens_in": response.usage.as_ref().map_or(0, |u| u.prompt_tokens),
@@ -243,19 +360,19 @@ impl BackoffProvider {
                     return Ok(response);
                 }
                 Err(e) => {
-                    attempt += 1;
+                    attempt_no += 1;
                     let class = classify_ai_error(&e);
                     trace::event(
                         "llm_attempt",
                         json!({
-                            "attempt": attempt,
+                            "attempt": attempt_no,
                             "duration_ms": attempt_started.elapsed().as_millis() as u64,
-                            "outcome": Self::class_str(&class),
+                            "outcome": BackoffProvider::class_str(&class),
                             "error": e.to_string(),
                         }),
                     );
-                    if let Some(max) = self.max_attempts
-                        && attempt >= max
+                    if let Some(max) = max_attempts
+                        && attempt_no >= max
                     {
                         return Err(e);
                     }
@@ -271,7 +388,7 @@ impl BackoffProvider {
                                     "retry_after_ms": retry_after.as_millis() as u64,
                                 }),
                             );
-                            self.quota.report_quota_error(retry_after).await;
+                            quota.report_quota_error(retry_after).await;
                         }
                         AiErrorClass::Transient { retry_after } => {
                             // Server-side blip. Exponential backoff with
@@ -279,11 +396,11 @@ impl BackoffProvider {
                             // Per-call, not global.
                             transient_streak += 1;
                             let mult = 2.0_f64.powi(transient_streak - 1).min(60.0);
-                            let backoff = self.base_delay.mul_f64(mult).max(retry_after);
+                            let backoff = base_delay.mul_f64(mult).max(retry_after);
                             let jittered = backoff + backoff.mul_f64(0.25 * fastrand::f64());
-                            let retry_target = match self.max_attempts {
-                                Some(max) => format!("{attempt}/{max}"),
-                                None => format!("{attempt}"),
+                            let retry_target = match max_attempts {
+                                Some(max) => format!("{attempt_no}/{max}"),
+                                None => format!("{attempt_no}"),
                             };
                             warn!(
                                 "{}Transient AI error (streak {}); backing off {:.1}s then retry {}: {}",
@@ -310,13 +427,12 @@ impl BackoffProvider {
             }
         }
     }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ai::gemini::GeminiError;
-    use crate::ai::{AiMessage, AiRole};
+    use crate::ai::{AiMessage, AiRole, ProviderSession};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     enum Behaviour {
@@ -522,5 +638,106 @@ mod tests {
             ActiveTimeExceededError.to_string(),
             "Review tool timed out (active time exceeded)"
         );
+    }
+
+    /// Observable state of a scripted native session, shared with the
+    /// consuming handle so a test can inspect it after close().
+    struct SessionState {
+        calls: AtomicU32,
+        closed: AtomicBool,
+    }
+
+    struct MockSession {
+        state: Arc<SessionState>,
+        fail_times: u32,
+        fatal: bool,
+    }
+
+    #[async_trait]
+    impl crate::ai::ProviderSession for MockSession {
+        async fn send(&mut self, _messages: Vec<AiMessage>) -> Result<AiResponse> {
+            let n = self.state.calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_times {
+                let err = if self.fatal {
+                    GeminiError::PermissionDenied("nope".into())
+                } else {
+                    GeminiError::TransientError(Duration::from_secs(0), "503".into())
+                };
+                return Err(err.into());
+            }
+            Ok(AiResponse {
+                content: Some("ok".into()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        async fn close(self: Box<Self>) -> Result<()> {
+            self.state.closed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A BackoffSession with a tiny base delay, like `fast` above.
+    fn fast_session(inner: Box<dyn crate::ai::ProviderSession>) -> BackoffSession {
+        BackoffSession {
+            inner,
+            quota: Arc::new(QuotaManager::new()),
+            base_delay: Duration::from_millis(1),
+            max_attempts: Some(MAX_ATTEMPTS),
+            budget: None,
+            context_tag: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn native_session_sends_retry_through_the_shared_loop() {
+        let state = Arc::new(SessionState {
+            calls: AtomicU32::new(0),
+            closed: AtomicBool::new(false),
+        });
+        let mut session = fast_session(Box::new(MockSession {
+            state: state.clone(),
+            fail_times: 2,
+            fatal: false,
+        }));
+
+        let response = session.send(vec![AiMessage {
+            role: AiRole::User,
+            content: Some("delta".into()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }]).await.unwrap();
+
+        assert_eq!(response.content.as_deref(), Some("ok"));
+        assert_eq!(state.calls.load(Ordering::SeqCst), 3); // 2 failures + success
+        Box::new(session).close().await.unwrap();
+        assert!(state.closed.load(Ordering::SeqCst), "close must propagate");
+    }
+
+    #[tokio::test]
+    async fn native_session_fatal_errors_do_not_retry() {
+        let state = Arc::new(SessionState {
+            calls: AtomicU32::new(0),
+            closed: AtomicBool::new(false),
+        });
+        let mut session = fast_session(Box::new(MockSession {
+            state: state.clone(),
+            fail_times: 1,
+            fatal: true,
+        }));
+
+        let error = session
+            .send(vec![])
+            .await
+            .err()
+            .expect("fatal error must propagate");
+        assert!(error.to_string().contains("nope"));
+        assert_eq!(state.calls.load(Ordering::SeqCst), 1);
     }
 }

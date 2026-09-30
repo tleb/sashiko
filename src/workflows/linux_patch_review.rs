@@ -20,9 +20,10 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::workflow::graph::Workflow;
+use crate::workflow::output::schema_for_type;
 use crate::workflow::output::OutputFormat;
 use crate::workflow::policy::{ParallelPolicy, RecitationPolicy, StagePolicy, ToolScope};
 use crate::workflow::prompt::PromptTemplate;
@@ -84,17 +85,17 @@ pub struct LinuxPatchReviewState {
 // Typed Output Structures for Stage Serialization
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, schemars::JsonSchema)]
 pub struct PrescreenOutput {
     pub selected_prompts: Vec<String>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, schemars::JsonSchema)]
 pub struct PlanningOutput {
     pub relevant_stages: Vec<String>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone, Default)]
+#[derive(Deserialize, Serialize, Debug, Clone, Default, schemars::JsonSchema)]
 pub struct StageConcernsOutput {
     #[serde(default)]
     pub concerns: Vec<Value>,
@@ -102,13 +103,13 @@ pub struct StageConcernsOutput {
     pub dismissed_concerns: Vec<Value>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone, Default)]
+#[derive(Deserialize, Serialize, Debug, Clone, Default, schemars::JsonSchema)]
 pub struct ConflictResolutionOutput {
     #[serde(default)]
     pub concerns: Vec<Value>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone, Default)]
+#[derive(Deserialize, Serialize, Debug, Clone, Default, schemars::JsonSchema)]
 pub struct VerificationOutput {
     #[serde(default)]
     pub findings: Vec<Value>,
@@ -510,16 +511,9 @@ pub fn prescreen_stage() -> Stage<LinuxPatchReviewState, PrescreenOutput> {
             .with_var("target_commit_diff", |s: &LinuxPatchReviewState| s.target_commit_diff.clone())
             .include_file("subsystem/subsystem.md"),
         )
-        .output_format(OutputFormat::json_with_schema(json!({
-            "type": "object",
-            "properties": {
-                "selected_prompts": {
-                    "type": "array",
-                    "items": { "type": "string" }
-                }
-            },
-            "required": ["selected_prompts"]
-        })))
+        .output_format(OutputFormat::json_with_schema(schema_for_type::<
+            PrescreenOutput,
+        >()))
         .policy(StagePolicy {
             tools: ToolScope::None,
             max_turns: 1,
@@ -562,6 +556,9 @@ You MUST respond with ONLY a JSON object, no other text. Use the names exactly a
 {"relevant_stages": ["resources", "locking", "security", "hardware"]}
 ```"#,
         ))
+        // Hand-written rather than derived: the enum of optional stage names
+        // is dynamic (it depends on the workflow's stage set), which a
+        // schema derived from PlanningOutput cannot express.
         .output_format(OutputFormat::json_with_schema(json!({
             "type": "object",
             "properties": {
@@ -840,7 +837,7 @@ fn analysis_stage(
             .system_prompt(linux_system_prompt(def.uses_commit_log))
             .user_prompt(user_template)
             .output_format(
-                OutputFormat::json()
+                OutputFormat::json_with_schema(schema_for_type::<StageConcernsOutput>())
                     .with_validator(validate_concerns_output)
                     .with_feedback_formatter(format_concerns_feedback),
             )
@@ -963,7 +960,7 @@ Example Output:
             }),
         )
         .output_format(
-            OutputFormat::json()
+            OutputFormat::json_with_schema(schema_for_type::<StageConcernsOutput>())
                 .with_validator(validate_concerns_output)
                 .with_feedback_formatter(format_concerns_feedback),
         )
@@ -1029,7 +1026,9 @@ Example Output:
                 serde_json::to_string_pretty(&s.deduplicated_dismissed_concerns).unwrap_or_default()
             }),
         )
-        .output_format(OutputFormat::json())
+        .output_format(OutputFormat::json_with_schema(schema_for_type::<
+            ConflictResolutionOutput,
+        >()))
         .policy(StagePolicy {
             tools: ToolScope::All,
             max_turns,
@@ -1104,7 +1103,9 @@ Example Output:
             }),
             VERIFICATION.wants_series_context,
         ))
-        .output_format(OutputFormat::json())
+        .output_format(OutputFormat::json_with_schema(schema_for_type::<
+            VerificationOutput,
+        >()))
         .policy(StagePolicy {
             tools: ToolScope::All,
             max_turns,
@@ -1294,11 +1295,9 @@ mod tests {
 
         // Matched on the file name, since that is what the pre-screen returns,
         // while the table holds the path a stage includes it by.
-        assert!(
-            ANALYSIS_STAGES
-                .iter()
-                .any(|d| d.guides.contains(&"subsystem/locking.md"))
-        );
+        assert!(ANALYSIS_STAGES
+            .iter()
+            .any(|d| d.guides.contains(&"subsystem/locking.md")));
         assert!(!is_stage_exclusive_guide("subsystem/locking.md"));
     }
 
@@ -1361,6 +1360,34 @@ mod tests {
         } else {
             panic!("expected planning stage to use json_with_schema");
         }
+    }
+
+    #[test]
+    fn test_every_json_stage_carries_a_schema_naming_its_fields() {
+        // The macb run showed agentic stages answering without any schema in
+        // their prompt; every JSON stage must now state one.
+        let prescreen = prescreen_stage();
+        let dedup = deduplication_stage(1, 0.2);
+        let conflict = conflict_resolution_stage(1, 0.2);
+        let verification = verification_stage(1, 0.2);
+        let schemas: [Option<&Value>; 4] = [
+            prescreen.output_format.schema(),
+            dedup.output_format.schema(),
+            conflict.output_format.schema(),
+            verification.output_format.schema(),
+        ];
+        for schema in schemas {
+            let schema = schema.expect("stage carries a schema");
+            let fields = schema["properties"].as_object().expect("schema properties");
+            assert!(!fields.is_empty());
+        }
+
+        // The shared analysis/dedup schema names the fields the model must
+        // answer with — the analysis stages embed it through a private
+        // builder, so assert on the schema itself.
+        let schema = schema_for_type::<StageConcernsOutput>();
+        assert!(schema["properties"]["concerns"].is_object());
+        assert!(schema["properties"]["dismissed_concerns"].is_object());
     }
 
     #[test]

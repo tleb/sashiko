@@ -23,7 +23,7 @@ use std::path::PathBuf;
 
 use crate::workflow::{
     ExecutableStage, OutputFormat, ParallelPolicy, PromptTemplate, RecitationPolicy, Stage,
-    StagePolicy, ToolScope, Workflow,
+    StagePolicy, ToolScope, Workflow, output::schema_for_type,
 };
 use crate::workflows::guard::{normalize_stage_name, sanitize_guide_name};
 use crate::workflows::linux_patch_review::{
@@ -680,16 +680,9 @@ pub fn prescreen_stage() -> Stage<SashikoPatchReviewState, PrescreenOutput> {
             })
             .include_file("subsystem/subsystem.md"),
         )
-        .output_format(OutputFormat::json_with_schema(json!({
-            "type": "object",
-            "properties": {
-                "selected_prompts": {
-                    "type": "array",
-                    "items": { "type": "string" }
-                }
-            },
-            "required": ["selected_prompts"]
-        })))
+        .output_format(OutputFormat::json_with_schema(schema_for_type::<
+            PrescreenOutput,
+        >()))
         .policy(StagePolicy {
             tools: ToolScope::None,
             max_turns: 1,
@@ -728,16 +721,9 @@ pub fn planning_stage() -> Stage<SashikoPatchReviewState, PlanningOutput> {
                 s.target_commit_diff.clone()
             }),
         )
-        .output_format(OutputFormat::json_with_schema(json!({
-            "type": "object",
-            "properties": {
-                "relevant_stages": {
-                    "type": "array",
-                    "items": { "type": "string" }
-                }
-            },
-            "required": ["relevant_stages"]
-        })))
+        .output_format(OutputFormat::json_with_schema(schema_for_type::<
+            PlanningOutput,
+        >()))
         .policy(StagePolicy {
             tools: ToolScope::None,
             max_turns: 1,
@@ -785,7 +771,7 @@ fn analysis_stage(
             .system_prompt(sashiko_system_prompt(def.uses_commit_log))
             .user_prompt(user_template)
             .output_format(
-                OutputFormat::json()
+                OutputFormat::json_with_schema(schema_for_type::<StageConcernsOutput>())
                     .with_validator(validate_concerns_output)
                     .with_feedback_formatter(format_concerns_feedback),
             )
@@ -861,7 +847,7 @@ Aggregated Dismissed Concerns:
             ),
         )
         .output_format(
-            OutputFormat::json()
+            OutputFormat::json_with_schema(schema_for_type::<StageConcernsOutput>())
                 .with_validator(validate_concerns_output)
                 .with_feedback_formatter(format_concerns_feedback),
         )
@@ -908,7 +894,9 @@ Return ONLY a JSON object with a 'concerns' array containing the remaining conce
                 },
             ),
         )
-        .output_format(OutputFormat::json())
+        .output_format(OutputFormat::json_with_schema(schema_for_type::<
+            ConflictResolutionOutput,
+        >()))
         .policy(StagePolicy {
             tools: ToolScope::All,
             max_turns,
@@ -961,7 +949,9 @@ Return ONLY a JSON object with a 'findings' array. Each object in the 'findings'
             }),
             VERIFICATION.wants_series_context,
         ))
-        .output_format(OutputFormat::json())
+        .output_format(OutputFormat::json_with_schema(schema_for_type::<
+            VerificationOutput,
+        >()))
         .policy(StagePolicy {
             tools: ToolScope::All,
             max_turns,

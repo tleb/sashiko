@@ -211,7 +211,7 @@ impl std::fmt::Debug for BugOutcome {
 // 1. Verification Session
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, schemars::JsonSchema)]
 pub struct VerificationJson {
     pub verification_reasoning: String,
     pub is_false_positive: bool,
@@ -220,7 +220,7 @@ pub struct VerificationJson {
     pub relevant_code_locations: Option<Value>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, schemars::JsonSchema)]
 pub struct NormalizationJson {
     pub canonical_title: String,
     pub canonical_description: String,
@@ -229,19 +229,19 @@ pub struct NormalizationJson {
     pub affected_symbols: Option<Vec<String>>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, schemars::JsonSchema)]
 pub struct DedupJson {
     pub is_duplicate: bool,
     pub duplicate_of_id: Option<i64>,
     pub reasoning: String,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, schemars::JsonSchema)]
 pub struct TracingJson {
     pub introducing_commit_sha: Option<String>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, schemars::JsonSchema)]
 pub struct SeverityJson {
     pub severity: String,
     pub severity_explanation: String,
@@ -345,7 +345,7 @@ Return ONLY a valid JSON object matching this schema:
     }
 
     fn response_format(&self) -> Option<AiResponseFormat> {
-        Some(AiResponseFormat::Json { schema: None })
+        Some(AiResponseFormat::Json { schema: Some(crate::workflow::output::schema_for_type::<VerificationJson>()) })
     }
 
     fn context_tag(&self) -> Option<String> {
@@ -448,7 +448,7 @@ Return ONLY a valid JSON object matching this schema:
     }
 
     fn response_format(&self) -> Option<AiResponseFormat> {
-        Some(AiResponseFormat::Json { schema: None })
+        Some(AiResponseFormat::Json { schema: Some(crate::workflow::output::schema_for_type::<NormalizationJson>()) })
     }
 
     fn context_tag(&self) -> Option<String> {
@@ -693,7 +693,7 @@ impl LlmSession for DedupSession<'_> {
     }
 
     fn response_format(&self) -> Option<AiResponseFormat> {
-        Some(AiResponseFormat::Json { schema: None })
+        Some(AiResponseFormat::Json { schema: Some(crate::workflow::output::schema_for_type::<DedupJson>()) })
     }
 
     fn context_tag(&self) -> Option<String> {
@@ -795,7 +795,7 @@ Return ONLY a valid JSON object matching this schema:
     }
 
     fn response_format(&self) -> Option<AiResponseFormat> {
-        Some(AiResponseFormat::Json { schema: None })
+        Some(AiResponseFormat::Json { schema: Some(crate::workflow::output::schema_for_type::<TracingJson>()) })
     }
 
     fn context_tag(&self) -> Option<String> {
@@ -879,7 +879,7 @@ Return ONLY a valid JSON object matching:
     }
 
     fn response_format(&self) -> Option<AiResponseFormat> {
-        Some(AiResponseFormat::Json { schema: None })
+        Some(AiResponseFormat::Json { schema: Some(crate::workflow::output::schema_for_type::<SeverityJson>()) })
     }
 
     fn context_tag(&self) -> Option<String> {

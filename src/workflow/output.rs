@@ -172,6 +172,14 @@ where
     }
 }
 
+/// Builds the JSON schema of a typed stage output via schemars, so the
+/// schema handed to the model in its prompt cannot drift from the struct
+/// deserialized from its answer.
+pub fn schema_for_type<T: schemars::JsonSchema>() -> Value {
+    serde_json::to_value(schemars::schema_for!(T))
+        .unwrap_or_else(|_| serde_json::json!({"type": "object"}))
+}
+
 /// Parses JSON from text with fallback extraction of embedded JSON objects.
 pub fn parse_json_from_text<T: DeserializeOwned>(raw_text: &str) -> Result<T, String> {
     let cleaned = crate::utils::clean_json_string(raw_text);

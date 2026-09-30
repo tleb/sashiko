@@ -141,6 +141,7 @@ Settings for the pi CLI provider (`provider = "pi-cli"`). The provider resolves 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `binary` | string | `pi` | Path of the pi binary. |
+| `thinking_level` | string | -- | Thinking level passed to pi (`--thinking`): one of its rungs (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Unset keeps pi's own default. A call that outgrows the hard per-call ceiling is retried once one rung below this level, so a deployment that already pins a level degrades relative to it. |
 | `session_dir` | string | -- | Where pi writes the session file of each completion, so runs can be visualised afterwards (`pi --export`, `/resume`, tail). Unset keeps every call ephemeral (`--no-session`); `"default"` uses pi's own session store (`~/.pi/agent/sessions/`); any other value is a directory to use. Sessions carry the patch and stage in their name. Note the session file contains the prompt, i.e. the patch under review - keep embargoed material in mind before pointing this at a shared location. |
 
 #### `[ai.gemini]`

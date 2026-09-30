@@ -29,6 +29,7 @@
 //! - `Fatal`: propagated immediately.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -70,13 +71,24 @@ pub trait RetryBudget: Send + Sync {
 pub struct DeadlineBudget {
     deadline: Arc<std::sync::Mutex<tokio::time::Instant>>,
     last_credit_end: std::sync::Mutex<Option<tokio::time::Instant>>,
+    /// Whether the one-shot wrap-up grace was already granted.
+    grace_granted: AtomicBool,
 }
+
+/// Window a budget grants once after expiring, for final synthesis turns.
+///
+/// Sized for one synthesis turn per straggler session (a full prompt re-send
+/// plus a short generation) plus one transient backoff, through the LLM
+/// gate's serialisation. It is a bounded exception to the deadline, not an
+/// extension of it: once spent, every further check fails.
+const FINAL_SYNTHESIS_GRACE: Duration = Duration::from_secs(180);
 
 impl DeadlineBudget {
     pub fn new(deadline: Arc<std::sync::Mutex<tokio::time::Instant>>) -> Self {
         Self {
             deadline,
             last_credit_end: std::sync::Mutex::new(None),
+            grace_granted: AtomicBool::new(false),
         }
     }
 }
@@ -106,15 +118,35 @@ impl RetryBudget for DeadlineBudget {
     }
 
     fn check(&self) -> Result<()> {
-        let current = { *self.deadline.lock().unwrap() };
-        if tokio::time::Instant::now() > current {
-            return Err(anyhow::anyhow!(
-                "Review tool timed out (active time exceeded)"
-            ));
+        let now = tokio::time::Instant::now();
+        if now <= { *self.deadline.lock().unwrap() } {
+            return Ok(());
         }
-        Ok(())
+        // The first expiry grants every caller one short wrap-up window:
+        // sessions spend it forcing a final synthesis turn out of the
+        // evidence already gathered instead of dropping it. The error still
+        // fires, so callers learn the budget is over and can degrade.
+        if !self.grace_granted.swap(true, Ordering::SeqCst) {
+            let mut deadline = self.deadline.lock().unwrap();
+            *deadline += FINAL_SYNTHESIS_GRACE;
+            warn!(
+                "review active-time budget exhausted; granting {}s of grace for final synthesis turns",
+                FINAL_SYNTHESIS_GRACE.as_secs()
+            );
+        }
+        Err(ActiveTimeExceededError.into())
     }
 }
+
+/// The review's active-time budget ran out (see [`DeadlineBudget`]).
+///
+/// Typed so the session runner can degrade to a final synthesis turn
+/// instead of dropping the evidence a stage already gathered. The display
+/// text is also the marker reviewer.rs matches on for its kill path, so it
+/// must not change.
+#[derive(Debug, thiserror::Error)]
+#[error("Review tool timed out (active time exceeded)")]
+pub struct ActiveTimeExceededError;
 
 /// Adds rate-limit and transient retry with backoff around an inner provider.
 pub struct BackoffProvider {
@@ -454,5 +486,41 @@ mod tests {
         budget.credit_wait(Duration::ZERO);
         let d3 = *deadline.lock().unwrap();
         assert_eq!(d2, d3);
+    }
+
+    #[tokio::test]
+    async fn deadline_budget_grants_one_wrap_up_grace() {
+        let deadline = Arc::new(std::sync::Mutex::new(
+            tokio::time::Instant::now() - Duration::from_millis(1),
+        ));
+        let budget = DeadlineBudget::new(deadline.clone());
+
+        // First expiry: the error fires, but the deadline jumps into the
+        // future by the grace window so a degraded caller's next check
+        // passes.
+        assert!(budget.check().is_err());
+        assert!(*deadline.lock().unwrap() > tokio::time::Instant::now());
+        assert!(budget.check().is_ok());
+
+        // Once the grace is spent, expiry is permanent: no second grant.
+        {
+            let mut d = deadline.lock().unwrap();
+            *d -= FINAL_SYNTHESIS_GRACE + Duration::from_millis(1);
+        }
+        assert!(budget.check().is_err());
+        assert!(budget.check().is_err());
+        assert!(
+            *deadline.lock().unwrap() <= tokio::time::Instant::now(),
+            "no further grace may be granted"
+        );
+    }
+
+    #[test]
+    fn active_time_error_keeps_its_display_text() {
+        // reviewer.rs matches the kill path on this exact text.
+        assert_eq!(
+            ActiveTimeExceededError.to_string(),
+            "Review tool timed out (active time exceeded)"
+        );
     }
 }

@@ -116,3 +116,31 @@ However, the `tokio::time::timeout` also guards against the *child process* hang
     *   Extend timeouts (`deadline += slept`).
     *   Report errors (`report_quota_error` or `report_transient_error`) or success (`report_success`).
 4.  **Implement `timeout_at` logic in `reviewer.rs`:** Replace the single block `tokio::time::timeout` with loop-level `timeout_at` to allow deadline extension.
+
+## Deadline degradation (implemented)
+
+A stage whose review ran out of active-time budget mid-investigation used to
+fail whole: every tool result it had gathered was dropped, and a review whose
+slowest stages both hit the deadline produced no findings at all.
+
+The deadline now degrades instead of aborting:
+
+*   `DeadlineBudget` (`src/ai/backoff_provider.rs`) returns a typed
+    `ActiveTimeExceededError` on expiry. Exactly once, on that first expiry,
+    it extends the deadline by a fixed grace window (`FINAL_SYNTHESIS_GRACE`,
+    180s): a bounded exception for wrap-up turns, not an extension of the
+    review. Every later check fails as before. The error's display text is
+    the marker `reviewer.rs` matches on for its kill path, so it must not
+    change.
+*   `SessionRunner` (`src/ai/session.rs`) catches that error, injects a
+    "TIME BUDGET EXHAUSTED" turn with the tools withdrawn, and spends the
+    grace window forcing the model to synthesize its verdict from the
+    evidence already in the history — the same mechanism the max-turns
+    budget uses. A session with no gathered evidence fails immediately, and
+    a second deadline error after the degrade fails the session.
+*   The grace is shared by every concurrent session of the same budget: the
+    LLM gate serialises their synthesis calls, so the window bounds the
+    extra work to a handful of final turns. Reviews driven through the
+    daemon's stdio bridge see the error as a generic provider failure and
+    keep the old hard-stop behaviour; only in-process (local review) runs
+    degrade today.

@@ -20,6 +20,7 @@ use super::{
     AiErrorClass, AiMessage, AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiTool,
     AiUsage, ToolCall, classify_ai_error,
 };
+use crate::ai::backoff_provider::ActiveTimeExceededError;
 
 /// The unified result of executing an [`LlmSession`].
 pub struct SessionResult<T> {
@@ -233,6 +234,9 @@ impl<'a> SessionRunner<'a> {
         let mut validation_attempts = 0;
         let mut transient_retries = 0;
         let mut provider_error_retries = 0;
+        // Set when the review's active-time budget forces the session into
+        // its final synthesis turn; see the deadline degrade branch below.
+        let mut forced_final = false;
         let mut total_prompt_tokens = 0;
         let mut total_completion_tokens = 0;
         let mut total_cached_tokens = 0;
@@ -281,7 +285,11 @@ impl<'a> SessionRunner<'a> {
                 log_history.push(final_prompt);
             }
 
-            let tools = if is_final_turn { None } else { session.tools() };
+            let tools = if is_final_turn || forced_final {
+                None
+            } else {
+                session.tools()
+            };
 
             let request = AiRequest {
                 system: Some(session.system_prompt()),
@@ -295,6 +303,40 @@ impl<'a> SessionRunner<'a> {
             let turn_started = std::time::Instant::now();
             let resp = match self.provider.generate_content(request).await {
                 Ok(r) => r,
+                Err(e) if !forced_final
+                    && history.len() > 1
+                    && e.downcast_ref::<ActiveTimeExceededError>().is_some() =>
+                {
+                    // The review's active-time budget is over, but the
+                    // session already holds evidence. Spend the budget's
+                    // wrap-up grace withdrawing the tools and forcing a
+                    // synthesis, rather than dropping the whole
+                    // investigation. The budget's next check, inside that
+                    // grace, lets exactly this one turn through.
+                    turn_event(
+                        turns,
+                        "deadline_degraded",
+                        serde_json::json!({
+                            "duration_ms": turn_started.elapsed().as_millis() as u64,
+                        }),
+                    );
+                    let final_prompt = AiMessage {
+                        role: AiRole::User,
+                        content: Some(
+                            "TIME BUDGET EXHAUSTED: The review's active-time budget ran out. Do NOT call any tools. Synthesize your final JSON verdict now based on the evidence gathered so far."
+                                .to_string(),
+                        ),
+                        thought: None,
+                        thought_signature: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                    };
+                    history.push(final_prompt.clone());
+                    log_history.push(final_prompt);
+                    forced_final = true;
+                    turns = turns.saturating_sub(1);
+                    continue;
+                }
                 Err(e) => match classify_ai_error(&e) {
                     AiErrorClass::RateLimit { retry_after }
                     | AiErrorClass::Transient { retry_after } => {
@@ -396,7 +438,7 @@ impl<'a> SessionRunner<'a> {
             if let Some(tool_calls) = &resp.tool_calls
                 && !tool_calls.is_empty()
             {
-                if is_final_turn {
+                if is_final_turn || forced_final {
                     tracing::warn!(
                         "Model emitted tool calls on final turn; ignoring tools to force validation."
                     );
@@ -669,5 +711,173 @@ mod tests {
                     .contains("TURN BUDGET EXHAUSTED")
         });
         assert!(exhausted_msg.is_some());
+    }
+
+    enum ScriptedTurn {
+        Response(AiResponse),
+        Deadline,
+    }
+
+    /// Like DummySession, but it offers a tool, so a test can assert the
+    /// degraded turn withdrew it.
+    struct TooledSession;
+
+    #[async_trait]
+    impl LlmSession for TooledSession {
+        type Output = String;
+
+        fn system_prompt(&self) -> String {
+            "system".to_string()
+        }
+
+        fn initial_user_prompt(&self) -> String {
+            "initial prompt".to_string()
+        }
+
+        async fn call_tool(&mut self, _name: &str, _args: Value) -> Result<Value> {
+            Ok(serde_json::json!({"result": "success"}))
+        }
+
+        fn tools(&self) -> Option<Vec<AiTool>> {
+            Some(vec![AiTool {
+                name: "ok_tool".to_string(),
+                description: "A tool".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }])
+        }
+
+        fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
+            Ok(response.content.clone().unwrap_or_default())
+        }
+    }
+
+    /// Pops scripted turns, recording whether the request carried tools so a
+    /// test can assert what the degraded final turn was allowed to call.
+    struct ScriptedProvider {
+        turns: Mutex<VecDeque<ScriptedTurn>>,
+        tools_offered: Mutex<Vec<bool>>,
+    }
+
+    impl ScriptedProvider {
+        fn new(turns: Vec<ScriptedTurn>) -> Self {
+            Self {
+                turns: Mutex::new(turns.into()),
+                tools_offered: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AiProvider for ScriptedProvider {
+        async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+            self.tools_offered
+                .lock()
+                .unwrap()
+                .push(request.tools.is_some());
+            match self.turns.lock().unwrap().pop_front() {
+                Some(ScriptedTurn::Response(r)) => Ok(r),
+                Some(ScriptedTurn::Deadline) => Err(ActiveTimeExceededError.into()),
+                None => anyhow::bail!("script exhausted"),
+            }
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "scripted".into(),
+                context_window_size: 4096,
+            }
+        }
+    }
+
+    fn tool_call_response() -> AiResponse {
+        AiResponse {
+            content: None,
+            thought: None,
+            thought_signature: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".to_string(),
+                function_name: "ok_tool".to_string(),
+                arguments: serde_json::json!({}),
+                thought_signature: None,
+            }]),
+            usage: None,
+            truncated: false,
+        }
+    }
+
+    fn content_response(text: &str) -> AiResponse {
+        AiResponse {
+            content: Some(text.to_string()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            usage: None,
+            truncated: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_session_runner_degrades_to_synthesis_on_deadline() {
+        let provider = ScriptedProvider::new(vec![
+            ScriptedTurn::Response(tool_call_response()),
+            ScriptedTurn::Deadline,
+            ScriptedTurn::Response(content_response("Saved by the grace window")),
+        ]);
+        let runner = SessionRunner::new(&provider);
+        let mut session = TooledSession;
+
+        let res = runner.run(&mut session).await.unwrap();
+
+        assert_eq!(res.output, "Saved by the grace window");
+        // Turn 1 investigated with tools, turn 2's attempt still offered them
+        // when the deadline fired, and the degraded turn withdrew them.
+        let tools_offered = provider.tools_offered.lock().unwrap().clone();
+        assert_eq!(tools_offered, vec![true, true, false]);
+        let degraded_msg = res.history.iter().find(|m| {
+            m.role == AiRole::User
+                && m
+                    .content
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("TIME BUDGET EXHAUSTED")
+        });
+        assert!(degraded_msg.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_deadline_before_any_evidence_fails_the_session() {
+        let provider = ScriptedProvider::new(vec![ScriptedTurn::Deadline]);
+        let runner = SessionRunner::new(&provider);
+        let mut session = DummySession;
+
+        let err = runner
+            .run(&mut session)
+            .await
+            .err()
+            .expect("session should fail");
+        assert!(err.to_string().contains("active time exceeded"));
+        // No evidence was gathered, so nothing was spent on a blind guess.
+        assert_eq!(provider.tools_offered.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_second_deadline_after_degrade_fails_the_session() {
+        let provider = ScriptedProvider::new(vec![
+            ScriptedTurn::Response(tool_call_response()),
+            ScriptedTurn::Deadline,
+            ScriptedTurn::Deadline,
+        ]);
+        let runner = SessionRunner::new(&provider);
+        let mut session = TooledSession;
+
+        let err = runner
+            .run(&mut session)
+            .await
+            .err()
+            .expect("session should fail");
+        assert!(err.to_string().contains("active time exceeded"));
+        // Degrade fired once; the grace-exhausted error propagated.
+        let tools_offered = provider.tools_offered.lock().unwrap().clone();
+        assert_eq!(tools_offered, vec![true, true, false]);
     }
 }

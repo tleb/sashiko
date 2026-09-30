@@ -493,6 +493,12 @@ pub struct PiCliSettings {
     /// [ai] endpoint settings applies to it beyond the model name.
     #[serde(default)]
     pub binary: Option<String>,
+    /// Where pi writes the session file of each completion, so runs can be
+    /// visualised afterwards (pi --export, /resume, tail). Unset keeps every
+    /// call ephemeral; "default" uses pi's own session store
+    /// (~/.pi/agent/sessions/); any other value is a directory to use.
+    #[serde(default)]
+    pub session_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

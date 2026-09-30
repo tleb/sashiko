@@ -83,18 +83,21 @@ pub struct PiCliProvider {
     pub model: String,
     /// Binary to run, overridable so tests can point at a fake.
     pub binary: String,
+    /// Where pi writes its session file, for visualising runs: None keeps
+    /// every call ephemeral, "default" is pi's own session store, anything
+    /// else is a directory. See PiCliSettings.session_dir.
+    pub session_dir: Option<String>,
     pub timeout_secs: u64,
 }
 
 impl PiCliProvider {
-    fn command(&self) -> Command {
+    fn command(&self, session_name: Option<&str>) -> Command {
         let mut cmd = Command::new(&self.binary);
         cmd.args([
             "-p",
             "--mode",
             "json",
             "--no-tools",
-            "--no-session",
             "--no-extensions",
             "--no-skills",
             "--no-context-files",
@@ -103,6 +106,22 @@ impl PiCliProvider {
             "--system-prompt",
             "",
         ]);
+        match self.session_dir.as_deref() {
+            None => {
+                cmd.arg("--no-session");
+            }
+            Some("default") => {}
+            Some(dir) => {
+                cmd.args(["--session-dir", dir]);
+            }
+        }
+        // A name carrying the patch and stage makes the session findable in
+        // pi's list; it only makes sense when a session is written at all.
+        if self.session_dir.is_some()
+            && let Some(name) = session_name
+        {
+            cmd.args(["--name", name]);
+        }
         if !self.model.is_empty() {
             cmd.args(["--model", &self.model]);
         }
@@ -119,9 +138,15 @@ impl AiProvider for PiCliProvider {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
         let prompt = build_prompt(&request);
         debug!("pi-cli prompt length: {} chars", prompt.len());
+        // The name joins the patch and stage into pi's session list, so a
+        // visualised run can be matched to the review that produced it.
+        let session_name = request
+            .context_tag
+            .as_ref()
+            .map(|tag| format!("sashiko {tag}"));
 
-        let mut child =
-            spawn_retrying(|| self.command()).map_err(|e| PiCliError::Spawn(e.to_string()))?;
+        let mut child = spawn_retrying(|| self.command(session_name.as_deref()))
+            .map_err(|e| PiCliError::Spawn(e.to_string()))?;
 
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(prompt.as_bytes()).await?;
@@ -192,12 +217,16 @@ fn parse_events(raw: &str) -> Result<(String, Option<AiUsage>, bool)> {
     let mut text: Option<String> = None;
     let mut usage = None;
     let mut truncated = false;
+    let mut last_error = None;
     for line in raw.lines() {
         let event: Value = match serde_json::from_str(line) {
             Ok(v) => v,
             // A non-JSON line is not one of pi's events; the run that produced
             // it answered the protocol badly enough to fail below.
-            Err(_) => continue,
+            Err(e) => {
+                last_error = Some(format!("line rejected as JSON: {e}"));
+                continue;
+            }
         };
         if event["type"] != "message_end" || event["message"]["role"] != "assistant" {
             continue;
@@ -236,7 +265,8 @@ fn parse_events(raw: &str) -> Result<(String, Option<AiUsage>, bool)> {
     match text {
         Some(text) => Ok((text, usage, truncated)),
         None => Err(PiCliError::Parse(format!(
-            "no assistant message in pi output: {}",
+            "no assistant message in pi output ({}): {}",
+            last_error.unwrap_or_else(|| "no parsable lines".to_string()),
             crate::utils::utf8_prefix(raw, 200)
         ))
         .into()),
@@ -270,19 +300,21 @@ mod tests {
     }
 
     /// Writes a fake pi binary: it records its arguments, then prints the
-    /// given stdout lines (or sleeps past the timeout). The script lands via
-    /// write-to-temp plus rename: executing a file that was just written can
-    /// fail with ETXTBSY while the inode still has a writer attached.
+    /// given stdout lines (or sleeps past the timeout). The events land in a
+    /// file the script cats, because pushing JSON through shell quoting gets
+    /// mangled differently by every echo implementation. The script itself
+    /// arrives via write-to-temp plus rename: executing a file that was just
+    /// written can fail with ETXTBSY while the inode still has a writer
+    /// attached.
     fn fake_pi(dir: &std::path::Path, stdout: &str, exit: Option<&str>) -> std::path::PathBuf {
+        std::fs::write(dir.join("events.jsonl"), stdout).unwrap();
         let path = dir.join("pi");
         let staging = dir.join("pi.tmp");
         let mut script = String::from("#!/bin/sh\necho \"$@\" > \"$(dirname \"$0\")/args.txt\"\n");
         if let Some(err) = exit {
             script.push_str(&format!("echo {err:?} >&2\nexit 1\n"));
         } else {
-            for line in stdout.lines() {
-                script.push_str(&format!("echo {line:?}\n"));
-            }
+            script.push_str("cat \"$(dirname \"$0\")/events.jsonl\"\n");
         }
         {
             let mut file = std::fs::File::create(&staging).unwrap();
@@ -318,8 +350,15 @@ mod tests {
         PiCliProvider {
             model: String::new(),
             binary: binary.to_string_lossy().into_owned(),
+            session_dir: None,
             timeout_secs: CALL_TIMEOUT_SECS,
         }
+    }
+
+    fn tagged_request() -> AiRequest {
+        let mut request = dummy_request();
+        request.context_tag = Some("[ps:0 p:1 s:4]".to_string());
+        request
     }
 
     #[tokio::test]
@@ -353,7 +392,7 @@ mod tests {
         );
         let pi = fake_pi(temp.path(), &events, None);
 
-        let response = provider(&pi).generate_content(dummy_request()).await?;
+        let response = provider(&pi).generate_content(tagged_request()).await?;
 
         let calls = response.tool_calls.unwrap();
         assert_eq!(calls[0].function_name, "git_log");
@@ -371,6 +410,61 @@ mod tests {
             assert!(args.contains(flag), "missing {flag} in: {args}");
         }
         assert!(!args.contains("--model"), "empty model must stay unset");
+        // Ephemeral by default: no name, nothing to find in a session list.
+        assert!(!args.contains("--name"));
+        assert!(!args.contains("--session-dir"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_a_session_dir_persists_named_sessions() -> Result<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        let events = assistant_end(
+            r#"{\"content\":\"ok\"}"#,
+            r#"{"input":1,"output":1,"totalTokens":2}"#,
+            "stop",
+        );
+        let pi = fake_pi(temp.path(), &events, None);
+        let provider = PiCliProvider {
+            session_dir: Some(sessions.to_string_lossy().into_owned()),
+            ..provider(&pi)
+        };
+
+        provider.generate_content(tagged_request()).await?;
+
+        let args = std::fs::read_to_string(temp.path().join("args.txt")).unwrap();
+        assert!(args.contains(&format!("--session-dir {}", sessions.display())));
+        assert!(args.contains("--name sashiko [ps:0 p:1 s:4]"));
+        assert!(
+            !args.contains("--no-session"),
+            "a dir means sessions are written"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_the_default_session_store_is_pis_own() -> Result<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let events = assistant_end(
+            r#"{\"content\":\"ok\"}"#,
+            r#"{"input":1,"output":1,"totalTokens":2}"#,
+            "stop",
+        );
+        let pi = fake_pi(temp.path(), &events, None);
+        let provider = PiCliProvider {
+            session_dir: Some("default".to_string()),
+            ..provider(&pi)
+        };
+
+        provider.generate_content(tagged_request()).await?;
+
+        // Neither an explicit directory nor the ephemeral flag: pi's own
+        // store (~/.pi/agent/sessions/) is the default target.
+        let args = std::fs::read_to_string(temp.path().join("args.txt")).unwrap();
+        assert!(!args.contains("--no-session"));
+        assert!(!args.contains("--session-dir"));
+        assert!(args.contains("--name"));
         Ok(())
     }
 
@@ -433,6 +527,7 @@ mod tests {
         let provider = PiCliProvider {
             model: String::new(),
             binary: pi.to_string_lossy().into_owned(),
+            session_dir: None,
             timeout_secs: 1,
         };
         let error = provider
@@ -483,6 +578,7 @@ mod tests {
         let provider = PiCliProvider {
             model: String::new(),
             binary: "pi".to_string(),
+            session_dir: None,
             timeout_secs: CALL_TIMEOUT_SECS,
         };
         let response = provider.generate_content(dummy_request()).await?;

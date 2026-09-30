@@ -334,6 +334,23 @@ cp docs/examples/Settings.pi-cli.toml Settings.toml
 - An empty `[ai] model` means "whatever pi defaults to"; set it to pin one
 - Token usage from pi's event stream feeds sashiko's accounting
 
+**Visualising sessions:**
+
+Each completion is one pi invocation. By default none of them persist
+(`--no-session`). To browse them afterwards:
+
+```toml
+[ai.pi_cli]
+session_dir = "default"   # pi's own ~/.pi/agent/sessions/
+# or a directory of your choosing:
+# session_dir = "/home/me/.local/share/sashiko/pi-sessions"
+```
+
+Sessions are named `sashiko <patch> <stage>`, so a review run's turns can
+be told apart in the session list and exported with `pi --export`. A
+session file contains the prompt, i.e. the patch under review; treat that
+carefully for embargoed material.
+
 ## Codex CLI
 
 Uses a local [Codex CLI](https://github.com/openai/codex) (OpenAI)

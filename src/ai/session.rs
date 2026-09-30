@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use super::{
     AiErrorClass, AiMessage, AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiTool,
-    AiUsage, ToolCall, classify_ai_error,
+    AiUsage, ProviderSession, ToolCall, classify_ai_error,
 };
 use crate::ai::backoff_provider::ActiveTimeExceededError;
 
@@ -151,6 +151,45 @@ pub struct TurnLimitError {
     pub max_turns: usize,
 }
 
+/// Where a turn's model call goes: a provider-native session that holds
+/// the transcript, or stateless full-history re-sends.
+enum TurnTransport {
+    Native(Box<dyn ProviderSession>),
+    Stateless,
+}
+
+impl TurnTransport {
+    /// Makes one model call. Stateless sends the whole request; native
+    /// sends only the messages not yet delivered and marks them delivered
+    /// on success, so a failed call retries the same delta.
+    async fn generate(
+        &mut self,
+        provider: &dyn AiProvider,
+        request: AiRequest,
+        history: &[AiMessage],
+        delivered: &mut usize,
+    ) -> Result<AiResponse> {
+        match self {
+            Self::Native(handle) => {
+                let mut delta = history[*delivered..].to_vec();
+                // The native session recorded its own reply; the assistant
+                // echo the runner appends after every successful call is
+                // already on the provider's side, so never re-deliver it.
+                while delta
+                    .first()
+                    .is_some_and(|m| m.role == AiRole::Assistant)
+                {
+                    delta.remove(0);
+                }
+                let resp = handle.send(delta).await?;
+                *delivered = history.len();
+                Ok(resp)
+            }
+            Self::Stateless => provider.generate_content(request).await,
+        }
+    }
+}
+
 /// Orchestrates the execution of an [`LlmSession`].
 pub struct SessionRunner<'a> {
     provider: &'a dyn AiProvider,
@@ -212,6 +251,56 @@ impl<'a> SessionRunner<'a> {
     where
         S: LlmSession,
     {
+        let mut transport = self.open_transport(session).await;
+        let outcome = self.run_loop(session, &mut transport).await;
+        // Close on every exit path — success, validation exhaustion,
+        // error — so a provider-native conversation never dangles.
+        if let TurnTransport::Native(handle) = transport {
+            if let Err(e) = handle.close().await {
+                tracing::warn!("provider session close failed: {e:#}");
+            }
+        }
+        outcome
+    }
+
+    /// Picks the transport for this run: a provider-native session when
+    /// the provider offers one, stateless full-history sends otherwise.
+    /// An open error degrades to stateless rather than failing the run:
+    /// the stateless calls then go through the provider's retry machinery.
+    async fn open_transport<S: LlmSession>(&self, session: &S) -> TurnTransport {
+        let request = AiRequest {
+            system: Some(session.system_prompt()),
+            messages: vec![AiMessage {
+                role: AiRole::User,
+                content: Some(session.initial_user_prompt()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            tools: session.tools(),
+            temperature: session.temperature(),
+            response_format: session.response_format(),
+            context_tag: session.context_tag(),
+        };
+        match self.provider.open_session(request).await {
+            Ok(Some(handle)) => TurnTransport::Native(handle),
+            Ok(None) => TurnTransport::Stateless,
+            Err(e) => {
+                tracing::warn!("native session unavailable ({e:#}); using stateless turns");
+                TurnTransport::Stateless
+            }
+        }
+    }
+
+    async fn run_loop<S>(
+        &self,
+        session: &mut S,
+        transport: &mut TurnTransport,
+    ) -> Result<SessionResult<S::Output>>
+    where
+        S: LlmSession,
+    {
         let mut history = vec![AiMessage {
             role: AiRole::User,
             content: Some(session.initial_user_prompt()),
@@ -237,6 +326,9 @@ impl<'a> SessionRunner<'a> {
         // Set when the review's active-time budget forces the session into
         // its final synthesis turn; see the deadline degrade branch below.
         let mut forced_final = false;
+        // Native transport only: how many history messages the provider's
+        // session already holds. Stateful deltas are derived from this.
+        let mut delivered = 0usize;
         let mut total_prompt_tokens = 0;
         let mut total_completion_tokens = 0;
         let mut total_cached_tokens = 0;
@@ -301,7 +393,10 @@ impl<'a> SessionRunner<'a> {
             };
 
             let turn_started = std::time::Instant::now();
-            let resp = match self.provider.generate_content(request).await {
+            let resp = match transport
+                .generate(self.provider, request, &history, &mut delivered)
+                .await
+            {
                 Ok(r) => r,
                 Err(e) if !forced_final
                     && history.len() > 1
@@ -537,7 +632,9 @@ mod tests {
     use super::*;
     use crate::ai::ProviderCapabilities;
     use std::collections::VecDeque;
+    use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     struct MockProvider {
         responses: Mutex<VecDeque<AiResponse>>,
@@ -879,5 +976,173 @@ mod tests {
         // Degrade fired once; the grace-exhausted error propagated.
         let tools_offered = provider.tools_offered.lock().unwrap().clone();
         assert_eq!(tools_offered, vec![true, true, false]);
+    }
+
+    /// Shared state between a native-session test provider and its handle:
+    /// the scripted responses, every delivered delta, and the close flag.
+    struct NativeState {
+        turns: Mutex<VecDeque<ScriptedTurn>>,
+        deltas: Mutex<Vec<Vec<AiMessage>>>,
+        closed: AtomicBool,
+        fail_open: AtomicBool,
+    }
+
+    impl NativeState {
+        fn with_turns(turns: Vec<ScriptedTurn>) -> Arc<Self> {
+            Arc::new(Self {
+                turns: Mutex::new(turns.into()),
+                deltas: Mutex::new(Vec::new()),
+                closed: AtomicBool::new(false),
+                fail_open: AtomicBool::new(false),
+            })
+        }
+    }
+
+    struct NativeSessionHandle(Arc<NativeState>);
+
+    #[async_trait]
+    impl ProviderSession for NativeSessionHandle {
+        async fn send(&mut self, messages: Vec<AiMessage>) -> Result<AiResponse> {
+            self.0.deltas.lock().unwrap().push(messages);
+            match self.0.turns.lock().unwrap().pop_front() {
+                Some(ScriptedTurn::Response(r)) => Ok(r),
+                Some(ScriptedTurn::Deadline) => Err(ActiveTimeExceededError.into()),
+                None => anyhow::bail!("script exhausted"),
+            }
+        }
+
+        async fn close(self: Box<Self>) -> Result<()> {
+            self.0.closed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct NativeProvider(Arc<NativeState>);
+
+    #[async_trait]
+    impl AiProvider for NativeProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            // Only reached on the open-failure fallback path.
+            match self.0.turns.lock().unwrap().pop_front() {
+                Some(ScriptedTurn::Response(r)) => Ok(r),
+                _ => anyhow::bail!("script exhausted"),
+            }
+        }
+
+        async fn open_session(
+            &self,
+            _request: AiRequest,
+        ) -> Result<Option<Box<dyn ProviderSession>>> {
+            if self.0.fail_open.load(Ordering::SeqCst) {
+                anyhow::bail!("open refused");
+            }
+            Ok(Some(Box::new(NativeSessionHandle(self.0.clone()))))
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "native-scripted".into(),
+                context_window_size: 4096,
+            }
+        }
+    }
+
+    /// A session whose output must be valid JSON, so raw content triggers
+    /// the validation-repair path.
+    struct JsonOnlySession;
+
+    #[async_trait]
+    impl LlmSession for JsonOnlySession {
+        type Output = serde_json::Value;
+
+        fn system_prompt(&self) -> String {
+            "system".to_string()
+        }
+
+        fn initial_user_prompt(&self) -> String {
+            "initial prompt".to_string()
+        }
+
+        async fn call_tool(&mut self, _name: &str, _args: Value) -> Result<Value> {
+            Ok(serde_json::json!({"result": "success"}))
+        }
+
+        fn validate(
+            &mut self,
+            response: &AiResponse,
+        ) -> Result<Self::Output, ValidationError> {
+            let text = response.content.as_deref().unwrap_or_default();
+            serde_json::from_str(text).map_err(|e| {
+                ValidationError::FormatViolation(format!("not valid JSON: {e}"))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_native_transport_sends_deltas_and_closes() {
+        let state = NativeState::with_turns(vec![
+            ScriptedTurn::Response(tool_call_response()),
+            ScriptedTurn::Response(content_response("done")),
+        ]);
+        let provider = NativeProvider(state.clone());
+        let runner = SessionRunner::new(&provider);
+        let mut session = TooledSession;
+
+        let res = runner.run(&mut session).await.unwrap();
+
+        assert_eq!(res.output, "done");
+        assert!(state.closed.load(Ordering::SeqCst), "session must close");
+        let deltas = state.deltas.lock().unwrap();
+        assert_eq!(deltas.len(), 2, "one send per turn");
+        // The first delta is the conversation's opening message.
+        assert_eq!(deltas[0].len(), 1);
+        assert_eq!(deltas[0][0].role, AiRole::User);
+        assert_eq!(deltas[0][0].content.as_deref(), Some("initial prompt"));
+        // The second delta is the tool result only — the assistant echo
+        // the runner appends is already in the provider's transcript.
+        assert_eq!(deltas[1].len(), 1);
+        assert_eq!(deltas[1][0].role, AiRole::Tool);
+    }
+
+    #[tokio::test]
+    async fn test_native_transport_repair_sends_only_the_feedback() {
+        let state = NativeState::with_turns(vec![
+            ScriptedTurn::Response(content_response("not json at all")),
+            ScriptedTurn::Response(content_response("{\"ok\": true}")),
+        ]);
+        let provider = NativeProvider(state.clone());
+        let runner = SessionRunner::new(&provider);
+        let mut session = JsonOnlySession;
+
+        let res = runner.run(&mut session).await.unwrap();
+
+        assert_eq!(res.output["ok"], serde_json::json!(true));
+        let deltas = state.deltas.lock().unwrap();
+        assert_eq!(deltas.len(), 2);
+        // The repair delta carries only the feedback message, not the
+        // conversation so far and not the invalid assistant echo.
+        assert_eq!(deltas[1].len(), 1);
+        assert_eq!(deltas[1][0].role, AiRole::User);
+        let feedback = deltas[1][0].content.as_deref().unwrap_or_default();
+        assert!(feedback.contains("not valid JSON"), "feedback: {feedback}");
+    }
+
+    #[tokio::test]
+    async fn test_open_failure_falls_back_to_stateless() {
+        let state = NativeState::with_turns(vec![ScriptedTurn::Response(
+            content_response("stateless answer"),
+        )]);
+        state.fail_open.store(true, Ordering::SeqCst);
+        let provider = NativeProvider(state.clone());
+        let runner = SessionRunner::new(&provider);
+        let mut session = DummySession;
+
+        let res = runner.run(&mut session).await.unwrap();
+
+        assert_eq!(res.output, "stateless answer");
+        assert!(
+            state.deltas.lock().unwrap().is_empty(),
+            "no native sends must happen after a failed open"
+        );
     }
 }

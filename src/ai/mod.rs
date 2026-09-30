@@ -374,6 +374,27 @@ pub trait AiProvider: Send + Sync {
     /// Returns the capabilities and constraints of this provider.
     fn get_capabilities(&self) -> ProviderCapabilities;
 
+    /// Opens a provider-native session for an iterative run, when the
+    /// provider keeps the transcript itself and can continue a
+    /// conversation without re-sending it (pi --session-id, for one).
+    ///
+    /// The request is the conversation's opening: system prompt, tools,
+    /// response format and the initial user message. It frames the
+    /// session; no model call happens here. The returned handle's first
+    /// `send` delivers that opening to the model, and later sends carry
+    /// only the new messages. Providers without native sessions return
+    /// `None` and the runner falls back to stateless full-history sends.
+    ///
+    /// Errors fall back to stateless mode too: the stateless path then
+    /// flows through the provider's own retry machinery.
+    async fn open_session(
+        &self,
+        request: AiRequest,
+    ) -> Result<Option<Box<dyn ProviderSession>>> {
+        let _ = request;
+        Ok(None)
+    }
+
     /// Returns cache statistics, if the provider supports local response caching.
     fn cache_stats(&self) -> Option<CacheStats> {
         None
@@ -387,6 +408,25 @@ pub trait AiProvider: Send + Sync {
     fn cache_identity(&self) -> String {
         self.get_capabilities().model_name
     }
+}
+
+/// A live, provider-managed conversation opened by
+/// [`AiProvider::open_session`].
+///
+/// The provider holds the transcript. Each [`send`](ProviderSession::send)
+/// carries only the messages not yet delivered — tool results, repair
+/// feedback, a forced-final prompt — which is what makes iteration cheap:
+/// a repair turn re-sends one message, not the whole conversation.
+#[async_trait]
+pub trait ProviderSession: Send {
+    /// Delivers the new messages and returns the model's answer. The
+    /// first send of a session carries the conversation's opening (see
+    /// [`AiProvider::open_session`]); later sends carry plain new turns.
+    async fn send(&mut self, messages: Vec<AiMessage>) -> Result<AiResponse>;
+
+    /// Tells the provider the runner is done with this conversation.
+    /// Consuming, so a closed session cannot be sent to again.
+    async fn close(self: Box<Self>) -> Result<()>;
 }
 
 /// Appends the knobs a provider applies outside the request to its model name,

@@ -34,8 +34,8 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::ai::{
-    AiErrorClass, AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ClassifyAiError,
-    ProviderCapabilities, ToolCall, cache_identity_with,
+    AiErrorClass, AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiUsage,
+    ClassifyAiError, ProviderCapabilities, ToolCall, cache_identity_with,
 };
 use crate::utils::utf8_prefix;
 
@@ -260,12 +260,28 @@ pub fn build_prompt(request: &AiRequest) -> String {
             ));
         }
         out.push_str("</available_tools>\n\n");
+        // The final-answer shape is the request's JSON schema when one is
+        // set; the generic content envelope only applies when the caller
+        // specified none.
+        let final_answer_instruction = match request.response_format.as_ref() {
+            Some(AiResponseFormat::Json {
+                schema: Some(schema),
+            }) => format!(
+                "For your FINAL answer (once you stop calling tools): ONLY a valid JSON object matching this schema: {}. \
+                 Do not include any explanation, markdown, or code fences — output raw JSON.",
+                serde_json::to_string(schema).unwrap_or_else(|_| "{}".to_string())
+            ),
+            _ => "For your final answer: {\"content\": \"YOUR RESPONSE\"}".to_string(),
+        };
         out.push_str(
             "RESPONSE FORMAT: You MUST respond with a SINGLE valid JSON object only (no markdown, no explanation).\n\
              To call tools: {\"tool_calls\": [{\"id\": \"c1\", \"function_name\": \"TOOL_NAME\", \"arguments\": {ARGS}}, {\"id\": \"c2\", \"function_name\": \"OTHER_TOOL\", \"arguments\": {ARGS2}}]}\n\
-             Put ALL tool calls in ONE tool_calls array. Do NOT output multiple JSON objects.\n\
-             For your final answer: {\"content\": \"YOUR RESPONSE\"}\n\
-             Do not mix both. Output exactly one JSON object.\n\
+             Put ALL tool calls in ONE tool_calls array. Do NOT output multiple JSON objects.\n",
+        );
+        out.push_str(&final_answer_instruction);
+        out.push('\n');
+        out.push_str(
+            "Do not mix both. Output exactly one JSON object.\n\
              Do NOT wrap the JSON in XML-style tags (no <assistant>, <tool_calls> or similar tags); output the raw JSON object only.\n",
         );
     } else if let Some(instruction) = request
@@ -581,8 +597,34 @@ mod tests {
 
         let prompt = build_prompt(&req);
         assert!(prompt.contains("RESPONSE FORMAT"));
-        assert!(prompt.contains("tool_calls"));
         assert!(prompt.contains("<available_tools>"));
+        // Without a schema the generic content envelope stays.
+        assert!(prompt.contains("For your final answer: {\"content\": \"YOUR RESPONSE\"}"));
+    }
+
+    #[test]
+    fn test_build_prompt_with_tools_and_schema_states_the_schema() {
+        let mut req = make_request(simple_user_msg());
+        req.tools = Some(vec![AiTool {
+            name: "git_log".to_string(),
+            description: "Show git log".to_string(),
+            parameters: json!({"type": "object"}),
+        }]);
+        req.response_format = Some(AiResponseFormat::Json {
+            schema: Some(json!({
+                "type": "object",
+                "properties": {"concerns": {"type": "array"}},
+                "required": ["concerns"]
+            })),
+        });
+
+        let prompt = build_prompt(&req);
+        assert!(prompt.contains("tool_calls"));
+        assert!(prompt.contains("For your FINAL answer"));
+        assert!(prompt.contains("matching this schema"));
+        assert!(prompt.contains("\"required\""));
+        // The generic envelope must not contradict the schema.
+        assert!(!prompt.contains("YOUR RESPONSE"));
     }
 
     #[test]

@@ -40,7 +40,8 @@ use tracing::{debug, warn};
 use crate::ai::claude_cli::build_prompt;
 use crate::ai::claude_cli::parse_inner_response;
 use crate::ai::{
-    AiErrorClass, AiProvider, AiRequest, AiResponse, AiUsage, ClassifyAiError, ProviderCapabilities,
+    AiErrorClass, AiMessage, AiProvider, AiRequest, AiResponse, AiRole, AiTool, AiUsage,
+    ClassifyAiError, ProviderCapabilities,
 };
 
 /// Hard ceiling per CLI call, as a backstop behind IDLE_TIMEOUT_SECS: a
@@ -108,8 +109,40 @@ pub struct PiCliProvider {
     pub idle_secs: u64,
 }
 
+/// The invocation configuration shared by the stateless provider and its
+/// native sessions: everything a pi command line and its two budgets need.
+#[derive(Clone)]
+struct PiCliConfig {
+    model: String,
+    binary: String,
+    thinking_level: Option<String>,
+    session_dir: Option<String>,
+    timeout_secs: u64,
+    idle_secs: u64,
+}
+
 impl PiCliProvider {
-    fn command(&self, session_name: Option<&str>, thinking: Option<&str>) -> Command {
+    fn config(&self) -> PiCliConfig {
+        PiCliConfig {
+            model: self.model.clone(),
+            binary: self.binary.clone(),
+            thinking_level: self.thinking_level.clone(),
+            session_dir: self.session_dir.clone(),
+            timeout_secs: self.timeout_secs,
+            idle_secs: self.idle_secs,
+        }
+    }
+}
+
+impl PiCliConfig {
+    /// Builds the pi command line. A session id makes the call resume that
+    /// session; a name labels it in pi's session list.
+    fn command(
+        &self,
+        session_id: Option<&str>,
+        session_name: Option<&str>,
+        thinking: Option<&str>,
+    ) -> Command {
         let mut cmd = Command::new(&self.binary);
         cmd.args([
             "-p",
@@ -126,6 +159,9 @@ impl PiCliProvider {
         ]);
         if let Some(level) = thinking {
             cmd.args(["--thinking", level]);
+        }
+        if let Some(id) = session_id {
+            cmd.args(["--session-id", id]);
         }
         match self.session_dir.as_deref() {
             // Unset keeps pi's own global store (~/.pi/agent/sessions/):
@@ -169,13 +205,14 @@ impl PiCliProvider {
     /// Spawns the CLI, feeds the prompt on stdin and reads the run to
     /// completion under the two call budgets. The thinking level rides the
     /// command line; None leaves pi's own default in place.
-    async fn run_pi(
+    async fn run(
         &self,
         prompt: &str,
+        session_id: Option<&str>,
         session_name: Option<&str>,
         thinking: Option<&str>,
     ) -> Result<(String, String, std::process::ExitStatus), PiCliError> {
-        let mut child = spawn_retrying(|| self.command(session_name, thinking))
+        let mut child = spawn_retrying(|| self.command(session_id, session_name, thinking))
             .map_err(|e| PiCliError::Spawn(e.to_string()))?;
 
         if let Some(mut stdin) = child.stdin.take() {
@@ -307,8 +344,14 @@ impl AiProvider for PiCliProvider {
             .as_ref()
             .map(|tag| format!("sashiko {tag}"));
 
-        let (stdout, stderr, status) = match self
-            .run_pi(&prompt, session_name.as_deref(), self.thinking_level.as_deref())
+        let config = self.config();
+        let (stdout, stderr, status) = match config
+            .run(
+                &prompt,
+                None,
+                session_name.as_deref(),
+                config.thinking_level.as_deref(),
+            )
             .await
         {
             Ok(run) => run,
@@ -316,13 +359,14 @@ impl AiProvider for PiCliProvider {
                 // A call that streamed for a whole ceiling was reasoning, not
                 // wedged: retry once one rung down so the model spends its
                 // second ceiling answering instead of thinking.
-                let Some(lower) = self.degraded_thinking_level() else {
+                let Some(lower) = config.degraded_thinking_level() else {
                     return Err(PiCliError::Timeout(secs).into());
                 };
                 warn!(
                     "pi CLI hit the {secs}s call ceiling; retrying once with --thinking {lower}"
                 );
-                self.run_pi(&prompt, session_name.as_deref(), Some(lower))
+                config
+                    .run(&prompt, None, session_name.as_deref(), Some(lower))
                     .await?
             }
             Err(e) => return Err(e.into()),
@@ -340,12 +384,140 @@ impl AiProvider for PiCliProvider {
         Ok(response)
     }
 
+    async fn open_session(
+        &self,
+        request: AiRequest,
+    ) -> Result<Option<Box<dyn crate::ai::ProviderSession>>> {
+        // Sessions always persist now, so this provider always iterates
+        // natively; the name mirrors the stateless path so the session is
+        // findable in pi's list.
+        let session_name = request
+            .context_tag
+            .as_ref()
+            .map(|tag| format!("sashiko {tag}"));
+        Ok(Some(Box::new(PiCliSession {
+            config: self.config(),
+            opening: request,
+            session_name,
+            session_id: None,
+            history: Vec::new(),
+        })))
+    }
+
     fn get_capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             model_name: self.model.clone(),
             context_window_size: 200_000,
         }
     }
+}
+
+/// A pi-backed native session.
+///
+/// The first send frames the whole conversation (system prompt, tools,
+/// protocol, schema) and mints the session; pi reports its id as the
+/// stream's first event. Later sends resume that session with
+/// --session-id and carry only the new messages. If pi never reports an
+/// id, every send re-frames the full locally kept history instead —
+/// stateless behaviour through the same handle, never a lost
+/// conversation.
+struct PiCliSession {
+    config: PiCliConfig,
+    opening: AiRequest,
+    session_name: Option<String>,
+    session_id: Option<String>,
+    /// Every delivered message plus the model's answers, kept for the
+    /// no-id fallback.
+    history: Vec<AiMessage>,
+}
+
+#[async_trait]
+impl crate::ai::ProviderSession for PiCliSession {
+    async fn send(&mut self, messages: Vec<AiMessage>) -> Result<AiResponse> {
+        let delta_start = self.history.len();
+        self.history.extend(messages);
+
+        let prompt = if self.session_id.is_some() {
+            crate::ai::claude_cli::render_messages(&self.history[delta_start..])
+        } else {
+            let mut request = self.opening.clone();
+            request.messages = self.history.clone();
+            build_prompt(&request)
+        };
+
+        let thinking = self.config.thinking_level.as_deref();
+        // The name labels the session at creation; a resumed call keeps it.
+        let name = if self.session_id.is_none() {
+            self.session_name.as_deref()
+        } else {
+            None
+        };
+        let (stdout, stderr, status) = match self
+            .config
+            .run(&prompt, self.session_id.as_deref(), name, thinking)
+            .await
+        {
+            Ok(run) => run,
+            Err(PiCliError::Timeout(secs)) => {
+                let Some(lower) = self.config.degraded_thinking_level() else {
+                    return Err(PiCliError::Timeout(secs).into());
+                };
+                warn!(
+                    "pi CLI hit the {secs}s call ceiling; retrying once with --thinking {lower}"
+                );
+                self.config
+                    .run(&prompt, self.session_id.as_deref(), name, Some(lower))
+                    .await?
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        if !status.success() {
+            return Err(
+                PiCliError::Cli(format!("exited with {}: {}", status, stderr.trim())).into(),
+            );
+        }
+
+        let (text, usage, truncated) = parse_events(&stdout)?;
+        let mut response = parse_inner_response(&text, usage)?;
+        response.truncated = truncated;
+
+        if self.session_id.is_none() {
+            self.session_id = parse_session_id(&stdout);
+        }
+        // The model's answer joins the local history for the no-id
+        // fallback; with an id, pi's transcript already holds it and the
+        // runner skips the echo when deriving deltas.
+        self.history.push(AiMessage {
+            role: AiRole::Assistant,
+            content: response.content.clone(),
+            thought: None,
+            thought_signature: None,
+            tool_calls: response.tool_calls.clone(),
+            tool_call_id: None,
+        });
+        Ok(response)
+    }
+
+    async fn close(self: Box<Self>) -> Result<()> {
+        // Each call already ran pi to completion; nothing dangles. The
+        // session file stays for post-mortems (pi --export).
+        Ok(())
+    }
+}
+
+/// pi reports the session id as the stream's first event; adopt it so
+/// later sends can resume the same session.
+fn parse_session_id(raw: &str) -> Option<String> {
+    for line in raw.lines() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
+            && v["type"] == "session"
+            && let Some(id) = v["id"].as_str()
+        {
+            return Some(id.to_string());
+        }
+    }
+    None
 }
 
 /// Spawns the command, retrying ETXTBSY a few times: executing a binary
@@ -537,6 +709,105 @@ mod tests {
         let mut request = dummy_request();
         request.context_tag = Some("[ps:0 p:1 s:4]".to_string());
         request
+    }
+
+    /// A fake pi that records each invocation's args and stdin, emits a
+    /// session event with a fixed id, then answers from events.jsonl.
+    fn session_pi(dir: &std::path::Path) -> std::path::PathBuf {
+        let body = concat!(
+            "d=$(dirname \"$0\")\n",
+            "n=$(cat \"$d/count\" 2>/dev/null || echo 0)\n",
+            "cat > \"$d/stdin$n.txt\"\n",
+            "echo \"$@\" > \"$d/args$n.txt\"\n",
+            "echo $((n + 1)) > \"$d/count\"\n",
+            "printf '%s\\n' '{\"type\":\"session\",\"version\":3,\"id\":\"01234567-89ab-cdef-0123-456789abcdef\"}'\n",
+            "cat \"$d/events.jsonl\"\n",
+        );
+        script_pi(dir, body)
+    }
+
+    fn session_answer_events() -> String {
+        assistant_end(
+            r#"{\"content\":\"session answer\"}"#,
+            r#"{"input":1,"output":1,"totalTokens":2}"#,
+            "stop",
+        )
+    }
+
+    #[tokio::test]
+    async fn test_native_session_frames_then_resumes() -> Result<()> {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("events.jsonl"), session_answer_events()).unwrap();
+        let pi = session_pi(temp.path());
+        let provider = provider(&pi);
+
+        let mut request = tagged_request();
+        request.system = Some("be brief".to_string());
+        request.tools = Some(vec![AiTool {
+            name: "git_log".to_string(),
+            description: "Show git log".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }]);
+        let mut session = provider.open_session(request).await?.expect("pi always opens");
+
+        let first = session
+            .send(vec![AiMessage {
+                role: AiRole::User,
+                content: Some("initial question".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }])
+            .await?;
+        assert_eq!(first.content.as_deref(), Some("session answer"));
+
+        let second = session
+            .send(vec![AiMessage {
+                role: AiRole::Tool,
+                content: Some("tool output".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: Some("t1".to_string()),
+            }])
+            .await?;
+        assert_eq!(second.content.as_deref(), Some("session answer"));
+        session.close().await?;
+
+        let args0 = std::fs::read_to_string(temp.path().join("args0.txt")).unwrap();
+        let args1 = std::fs::read_to_string(temp.path().join("args1.txt")).unwrap();
+        let stdin0 = std::fs::read_to_string(temp.path().join("stdin0.txt")).unwrap();
+        let stdin1 = std::fs::read_to_string(temp.path().join("stdin1.txt")).unwrap();
+
+        // First call frames the conversation and names the session; it must
+        // not resume anything.
+        assert!(stdin0.contains("<system>"));
+        assert!(stdin0.contains("initial question"));
+        assert!(stdin0.contains("<available_tools>"));
+        assert!(args0.contains("--name"), "first call args: {args0}");
+        assert!(!args0.contains("--session-id"), "first call args: {args0}");
+
+        // Later calls resume the session and carry only the new messages.
+        assert!(
+            args1.contains("--session-id 01234567-89ab-cdef-0123-456789abcdef"),
+            "resume args: {args1}"
+        );
+        assert!(stdin1.contains("<tool_result"), "delta prompt: {stdin1}");
+        assert!(!stdin1.contains("<system>"), "delta must not re-frame: {stdin1}");
+        assert!(!stdin1.contains("initial question"), "delta: {stdin1}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_session_id_reads_the_first_event() {
+        let raw = concat!(
+            "{\"type\":\"session\",\"version\":3,\"id\":\"abc\"}\n",
+            "node: noise\n",
+            "{\"type\":\"agent_start\"}\n",
+        );
+        assert_eq!(parse_session_id(raw).as_deref(), Some("abc"));
+        assert_eq!(parse_session_id("no events here"), None);
     }
 
     #[tokio::test]

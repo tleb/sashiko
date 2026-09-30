@@ -34,7 +34,7 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::ai::{
-    AiErrorClass, AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiUsage,
+    AiErrorClass, AiMessage, AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiUsage,
     ClassifyAiError, ProviderCapabilities, ToolCall, cache_identity_with,
 };
 use crate::utils::utf8_prefix;
@@ -209,44 +209,7 @@ pub fn build_prompt(request: &AiRequest) -> String {
         out.push_str("\n</system>\n\n");
     }
 
-    // Conversation history
-    for msg in &request.messages {
-        match &msg.role {
-            AiRole::System => {
-                // Already handled above; skip embedded system messages
-            }
-            AiRole::User => {
-                out.push_str("<user>\n");
-                if let Some(c) = &msg.content {
-                    out.push_str(c);
-                }
-                out.push_str("\n</user>\n\n");
-            }
-            AiRole::Assistant => {
-                out.push_str("<assistant>\n");
-                if let Some(c) = &msg.content {
-                    out.push_str(c);
-                }
-                if let Some(calls) = &msg.tool_calls {
-                    for call in calls {
-                        out.push_str(&format!(
-                            "<tool_call id=\"{}\" name=\"{}\">\n{}\n</tool_call>\n",
-                            call.id, call.function_name, call.arguments
-                        ));
-                    }
-                }
-                out.push_str("</assistant>\n\n");
-            }
-            AiRole::Tool => {
-                let id = msg.tool_call_id.as_deref().unwrap_or("?");
-                out.push_str(&format!("<tool_result id=\"{}\">\n", id));
-                if let Some(c) = &msg.content {
-                    out.push_str(c);
-                }
-                out.push_str("\n</tool_result>\n\n");
-            }
-        }
-    }
+    out.push_str(&render_messages(&request.messages));
 
     // Tool definitions and response instructions
     if let Some(tools) = &request.tools
@@ -319,6 +282,52 @@ fn parse_usage(outer: &Value) -> Option<AiUsage> {
             None
         },
     })
+}
+
+/// Renders conversation messages in the flattened tag format the CLI
+/// protocol speaks. `build_prompt` embeds this for a full request;
+/// provider-native sessions use it to render a turn's delta, so a resumed
+/// model sees the same shapes it was first framed with.
+pub fn render_messages(messages: &[AiMessage]) -> String {
+    let mut out = String::new();
+    for msg in messages {
+        match &msg.role {
+            AiRole::System => {
+                // Handled by the caller framing the request; skip.
+            }
+            AiRole::User => {
+                out.push_str("<user>\n");
+                if let Some(c) = &msg.content {
+                    out.push_str(c);
+                }
+                out.push_str("\n</user>\n\n");
+            }
+            AiRole::Assistant => {
+                out.push_str("<assistant>\n");
+                if let Some(c) = &msg.content {
+                    out.push_str(c);
+                }
+                if let Some(calls) = &msg.tool_calls {
+                    for call in calls {
+                        out.push_str(&format!(
+                            "<tool_call id=\"{}\" name=\"{}\">\n{}\n</tool_call>\n",
+                            call.id, call.function_name, call.arguments
+                        ));
+                    }
+                }
+                out.push_str("</assistant>\n\n");
+            }
+            AiRole::Tool => {
+                let id = msg.tool_call_id.as_deref().unwrap_or("?");
+                out.push_str(&format!("<tool_result id=\"{}\">\n", id));
+                if let Some(c) = &msg.content {
+                    out.push_str(c);
+                }
+                out.push_str("\n</tool_result>\n\n");
+            }
+        }
+    }
+    out
 }
 
 pub fn parse_inner_response(text: &str, usage: Option<AiUsage>) -> Result<AiResponse> {

@@ -29,7 +29,7 @@ use async_trait::async_trait;
 use tracing::info;
 
 use crate::ai::{
-    AiMessage, AiProvider, AiRequest, AiResponse, AiRole, CacheStats, ProviderCapabilities,
+    AiMessage, AiProvider, AiRequest, AiResponse, CacheStats, ProviderCapabilities,
     ProviderSession,
 };
 

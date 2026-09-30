@@ -190,17 +190,32 @@ pub fn parse_json_from_text<T: DeserializeOwned>(raw_text: &str) -> Result<T, St
         return Ok(val);
     }
 
-    // Try finding JSON objects in text (e.g. within ```json ``` blocks or braces)
     let candidates = find_json_candidates(raw_text);
+    if candidates.is_empty() {
+        // Nothing JSON-shaped at all (prose, a refusal, spam): say so,
+        // because "failed to parse" invites a fix to the JSON rather than
+        // to the response's shape.
+        return Err(format!(
+            "the response contains no JSON object at all — respond with ONLY a JSON object. Response starts with: {}",
+            crate::utils::utf8_prefix(raw_text, 120)
+        ));
+    }
+
+    // Something JSON-shaped is there; keep the most informative
+    // deserialization error instead of discarding every one, so the retry
+    // feedback can name the field that was wrong.
+    let mut last_error = None;
     for cand in candidates.into_iter().rev() {
-        if let Ok(val) = serde_json::from_value::<T>(cand) {
-            return Ok(val);
+        match serde_json::from_value::<T>(cand) {
+            Ok(val) => return Ok(val),
+            Err(e) => last_error = Some(e),
         }
     }
 
     Err(format!(
-        "Failed to parse JSON from output: {}",
-        crate::utils::utf8_prefix(raw_text, 200)
+        "the response contains JSON but it does not match the expected shape: {}. Response starts with: {}",
+        last_error.expect("at least one candidate was tried"),
+        crate::utils::utf8_prefix(raw_text, 120)
     ))
 }
 
@@ -308,5 +323,30 @@ mod tests {
                 count: 7
             }
         );
+    }
+
+    #[test]
+    fn test_prose_is_reported_as_no_json_at_all() {
+        let fmt = OutputFormat::<(), DummyOutput>::json();
+        let err = fmt
+            .validate("I'll analyze this patch and gather context first.", &())
+            .unwrap_err();
+        assert!(
+            err.contains("contains no JSON object at all"),
+            "violation: {err}"
+        );
+    }
+
+    #[test]
+    fn test_wrong_shape_names_the_field() {
+        let fmt = OutputFormat::<(), DummyOutput>::json();
+        // JSON is present but `count` is missing: the violation must say
+        // so, so the retry feedback can point at the exact defect.
+        let err = fmt.validate(r#"{"name": "x"}"#, &()).unwrap_err();
+        assert!(
+            err.contains("does not match the expected shape"),
+            "violation: {err}"
+        );
+        assert!(err.contains("missing field"), "violation: {err}");
     }
 }

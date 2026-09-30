@@ -35,7 +35,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{Instant, sleep_until, timeout};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::ai::claude_cli::build_prompt;
 use crate::ai::claude_cli::parse_inner_response;
@@ -53,6 +53,9 @@ pub const CALL_TIMEOUT_SECS: u64 = 1800;
 /// generation emits message_update deltas tens of milliseconds apart, so
 /// silence means a wedged stream, not slow thinking.
 pub const IDLE_TIMEOUT_SECS: u64 = 90;
+
+/// pi's thinking levels, lowest to highest, as accepted by --thinking.
+const THINKING_LADDER: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum PiCliError {
@@ -96,6 +99,8 @@ pub struct PiCliProvider {
     /// every call ephemeral, "default" is pi's own session store, anything
     /// else is a directory. See PiCliSettings.session_dir.
     pub session_dir: Option<String>,
+    /// Thinking level passed as `--thinking`; None keeps pi's own default.
+    pub thinking_level: Option<String>,
     /// Hard per-call budget; the backstop behind idle_secs.
     pub timeout_secs: u64,
     /// No-progress limit: killed when no stream delta arrives for this long.
@@ -103,7 +108,7 @@ pub struct PiCliProvider {
 }
 
 impl PiCliProvider {
-    fn command(&self, session_name: Option<&str>) -> Command {
+    fn command(&self, session_name: Option<&str>, thinking: Option<&str>) -> Command {
         let mut cmd = Command::new(&self.binary);
         cmd.args([
             "-p",
@@ -118,6 +123,9 @@ impl PiCliProvider {
             "--system-prompt",
             "",
         ]);
+        if let Some(level) = thinking {
+            cmd.args(["--thinking", level]);
+        }
         match self.session_dir.as_deref() {
             None => {
                 cmd.arg("--no-session");
@@ -142,6 +150,46 @@ impl PiCliProvider {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         cmd
+    }
+
+    /// The thinking level one rung below the call's starting level, or None
+    /// at the bottom of the ladder.
+    ///
+    /// An unset setting starts from "high": that is pi's default for the
+    /// reasoning models this provider is used with, and the level whose
+    /// calls were observed outgrowing a whole call ceiling. A configured
+    /// level that matches no rung degrades to None, keeping the retry a
+    /// strict step down rather than a guess.
+    fn degraded_thinking_level(&self) -> Option<&'static str> {
+        let base = self.thinking_level.as_deref().unwrap_or("high");
+        let index = THINKING_LADDER.iter().position(|level| *level == base)?;
+        (index > 0).then(|| THINKING_LADDER[index - 1])
+    }
+
+    /// Spawns the CLI, feeds the prompt on stdin and reads the run to
+    /// completion under the two call budgets. The thinking level rides the
+    /// command line; None leaves pi's own default in place.
+    async fn run_pi(
+        &self,
+        prompt: &str,
+        session_name: Option<&str>,
+        thinking: Option<&str>,
+    ) -> Result<(String, String, std::process::ExitStatus), PiCliError> {
+        let mut child = spawn_retrying(|| self.command(session_name, thinking))
+            .map_err(|e| PiCliError::Spawn(e.to_string()))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(prompt.as_bytes())
+                .await
+                .map_err(|e| PiCliError::Wait(e.to_string()))?;
+            stdin
+                .flush()
+                .await
+                .map_err(|e| PiCliError::Wait(e.to_string()))?;
+        }
+
+        self.read_to_completion(child).await
     }
 
     /// Reads the CLI's stdout event stream until the process exits, under
@@ -259,15 +307,26 @@ impl AiProvider for PiCliProvider {
             .as_ref()
             .map(|tag| format!("sashiko {tag}"));
 
-        let mut child = spawn_retrying(|| self.command(session_name.as_deref()))
-            .map_err(|e| PiCliError::Spawn(e.to_string()))?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(prompt.as_bytes()).await?;
-            stdin.flush().await?;
-        }
-
-        let (stdout, stderr, status) = self.read_to_completion(child).await?;
+        let (stdout, stderr, status) = match self
+            .run_pi(&prompt, session_name.as_deref(), self.thinking_level.as_deref())
+            .await
+        {
+            Ok(run) => run,
+            Err(PiCliError::Timeout(secs)) => {
+                // A call that streamed for a whole ceiling was reasoning, not
+                // wedged: retry once one rung down so the model spends its
+                // second ceiling answering instead of thinking.
+                let Some(lower) = self.degraded_thinking_level() else {
+                    return Err(PiCliError::Timeout(secs).into());
+                };
+                warn!(
+                    "pi CLI hit the {secs}s call ceiling; retrying once with --thinking {lower}"
+                );
+                self.run_pi(&prompt, session_name.as_deref(), Some(lower))
+                    .await?
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         if !status.success() {
             return Err(
@@ -468,6 +527,7 @@ mod tests {
             model: String::new(),
             binary: binary.to_string_lossy().into_owned(),
             session_dir: None,
+            thinking_level: None,
             timeout_secs: CALL_TIMEOUT_SECS,
             idle_secs: IDLE_TIMEOUT_SECS,
         }
@@ -636,6 +696,7 @@ mod tests {
             model: String::new(),
             binary: pi.to_string_lossy().into_owned(),
             session_dir: None,
+            thinking_level: None,
             timeout_secs: 60,
             idle_secs: 1,
         };
@@ -741,6 +802,83 @@ mod tests {
         Ok(())
     }
 
+    /// A fake pi that streams a live delta forever on its first invocation
+    /// (hitting the hard ceiling) and answers from a file on every later one,
+    /// recording its command line per invocation.
+    fn ceiling_then_answer_pi(dir: &std::path::Path) -> std::path::PathBuf {
+        let delta = thinking_delta();
+        let body = format!(
+            concat!(
+                "d=$(dirname \"$0\")\n",
+                "n=$(cat \"$d/count\" 2>/dev/null || echo 0)\n",
+                "echo \"$@\" > \"$d/args$n.txt\"\n",
+                "echo $((n + 1)) > \"$d/count\"\n",
+                "if [ \"$n\" = \"0\" ]; then\n",
+                "  printf '%s\\n' '{delta}'\n",
+                "  sleep 30\n",
+                "else\n",
+                "  cat \"$d/events.jsonl\"\n",
+                "fi\n",
+            ),
+            delta = delta,
+        );
+        script_pi(dir, &body)
+    }
+
+    fn answer_events() -> String {
+        assistant_end(
+            r#"{\"content\":\"degraded but answered\"}"#,
+            r#"{"input":1,"output":1,"totalTokens":2}"#,
+            "stop",
+        )
+    }
+
+    #[tokio::test]
+    async fn test_a_ceiling_timeout_retries_once_at_a_lower_rung() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("events.jsonl"), answer_events()).unwrap();
+        let pi = ceiling_then_answer_pi(temp.path());
+        let provider = PiCliProvider {
+            timeout_secs: 1,
+            idle_secs: 60,
+            ..provider(&pi)
+        };
+
+        let response = provider.generate_content(dummy_request()).await.unwrap();
+
+        assert_eq!(response.content.as_deref(), Some("degraded but answered"));
+        let first = std::fs::read_to_string(temp.path().join("args0.txt")).unwrap();
+        let second = std::fs::read_to_string(temp.path().join("args1.txt")).unwrap();
+        assert!(!first.contains("--thinking"), "first call: {first}");
+        // "high" is the assumed starting rung for an unset setting.
+        assert!(second.contains("--thinking medium"), "retry: {second}");
+    }
+
+    #[tokio::test]
+    async fn test_a_ceiling_timeout_at_the_bottom_rung_does_not_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("events.jsonl"), answer_events()).unwrap();
+        let pi = ceiling_then_answer_pi(temp.path());
+        let provider = PiCliProvider {
+            timeout_secs: 1,
+            idle_secs: 60,
+            thinking_level: Some("off".to_string()),
+            ..provider(&pi)
+        };
+
+        let error = provider
+            .generate_content(dummy_request())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<PiCliError>(),
+            Some(PiCliError::Timeout(_))
+        ));
+        // Only the ceiling-hitting call ran; the answering script never did.
+        assert!(temp.path().join("args0.txt").exists());
+        assert!(!temp.path().join("args1.txt").exists());
+    }
+
     #[test]
     fn test_only_delta_and_end_events_count_as_progress() {
         assert!(is_progress_event(&thinking_delta()));
@@ -792,6 +930,7 @@ mod tests {
             model: String::new(),
             binary: "pi".to_string(),
             session_dir: None,
+            thinking_level: None,
             timeout_secs: CALL_TIMEOUT_SECS,
             idle_secs: IDLE_TIMEOUT_SECS,
         };

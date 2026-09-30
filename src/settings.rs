@@ -493,6 +493,12 @@ pub struct PiCliSettings {
     /// [ai] endpoint settings applies to it beyond the model name.
     #[serde(default)]
     pub binary: Option<String>,
+    /// Thinking level passed to pi (--thinking): one of pi's rungs (off,
+    /// minimal, low, medium, high, xhigh, max). Unset keeps pi's own
+    /// default. A call that outgrows the hard per-call ceiling is retried
+    /// once at the next lower rung.
+    #[serde(default)]
+    pub thinking_level: Option<String>,
     /// Where pi writes the session file of each completion, so runs can be
     /// visualised afterwards (pi --export, /resume, tail). Unset keeps every
     /// call ephemeral; "default" uses pi's own session store

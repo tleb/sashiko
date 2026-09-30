@@ -652,6 +652,7 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 .as_ref()
                 .and_then(|c| c.binary.clone())
                 .unwrap_or_else(|| "pi".to_string()),
+            thinking_level: ai.pi_cli.as_ref().and_then(|c| c.thinking_level.clone()),
             session_dir: ai.pi_cli.as_ref().and_then(|c| c.session_dir.clone()),
             timeout_secs: pi_cli::CALL_TIMEOUT_SECS,
             idle_secs: pi_cli::IDLE_TIMEOUT_SECS,

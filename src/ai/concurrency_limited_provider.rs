@@ -39,15 +39,25 @@ static LLM_GATE: OnceLock<Semaphore> = OnceLock::new();
 ///
 /// Called by each front end (the daemon, a local review, the benchmark)
 /// before any model call is made. The first call wins: a later one with a
-/// different value is ignored, as the permits are already out. A process
-/// that never calls this gets the setting's default.
+/// different value is ignored — and warned about — as the permits are
+/// already out. A process that never calls this gets the setting's default.
 pub fn init_llm_gate(permits: usize) {
-    let _ = LLM_GATE.set(Semaphore::new(permits.max(1)));
+    let permits = permits.max(1);
+    if LLM_GATE.set(Semaphore::new(permits)).is_err() {
+        // Either another front end sized the gate first, or a model call
+        // already fell back to the default before this ran: the knob is
+        // dead either way and the process keeps the earlier ceiling.
+        tracing::warn!(
+            "max_concurrent_requests = {permits} ignored: the process-wide LLM gate was already sized"
+        );
+    }
 }
 
 /// The process-wide pool of in-flight model-call permits.
 pub fn llm_gate() -> &'static Semaphore {
-    LLM_GATE.get_or_init(|| Semaphore::new(3))
+    LLM_GATE.get_or_init(|| {
+        Semaphore::new(crate::settings::default_max_concurrent_requests().max(1))
+    })
 }
 
 /// Limits concurrent model calls to the permits of the process-wide gate. All

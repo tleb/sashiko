@@ -579,7 +579,10 @@ fn default_api_timeout_secs() -> u64 {
     300
 }
 
-fn default_max_concurrent_requests() -> usize {
+/// The fallback size of the process-wide LLM gate when no front end calls
+/// [`crate::ai::concurrency_limited_provider::init_llm_gate`] before the
+/// first model call; see that function for the knob's semantics.
+pub(crate) fn default_max_concurrent_requests() -> usize {
     3
 }
 
